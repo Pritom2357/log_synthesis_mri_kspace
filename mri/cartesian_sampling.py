@@ -12,10 +12,16 @@ __all__ = ["make_mask","achieved_acceleration"] # Only these will be exported fr
 # -----------------------------------------------------------------
 
 def _uniform_mask(shape:tuple[int,int],R:int)->np.ndarray:
-    """Keeps every R-th row; zero out the remaining."""
+    """
+    Keeps every R-th row; zero out the remaining.
 
+    The pattern is anchored on the DC row rather than row 0. Counting from row 0
+    drops the centre line whenever rows//2 is not divisible by R, which throws
+    away the brightest sample in k-space and darkens the whole reconstruction.
+    """
+    rows,_ = shape
     mask = np.zeros(shape,dtype=np.uint8)
-    mask[::R,:] = 1
+    mask[(rows//2)%R::R,:] = 1
     return mask
 
 def _variable_density_mask(shape:tuple[int,int],R:int,center_frac:float=0.15,periphery:str = "uniform",seed:int|None=None)->np.ndarray:
@@ -32,7 +38,7 @@ def _variable_density_mask(shape:tuple[int,int],R:int,center_frac:float=0.15,per
         row_keep = rng.random(rows) < (1.0/R)
         mask[row_keep,:] = 1
     elif periphery == "uniform":
-        mask[::R,:] = 1
+        mask[(rows//2)%R::R,:] = 1
     else:
         raise ValueError(f"Unknown periphery mode:{periphery!r}")
     
@@ -151,6 +157,13 @@ if __name__ == "__main__":
     assert abs(stats["R_actual"] - 2.0) < 1e-9, stats
     print(f"[uniform R=2]        rows_set={rows_set:3d}  R_actual={stats['R_actual']:.3f}  frac={stats['fraction_sampled']:.3f}")
  
+    # --- The DC row must survive at every R, not just the even ones ---
+    for R in range(1, 9):
+        m_r = make_mask("uniform", shape, R=R)
+        assert m_r[shape[0] // 2, 0] == 1, f"uniform R={R} dropped the DC row"
+        assert abs(achieved_acceleration(m_r)["R_actual"] - R) < 0.1, f"R={R} drifted"
+    print("[uniform R=1..8]     DC row kept at every R, R_actual within 0.1")
+
     # --- Variable density: center should be denser than a plain uniform mask ---
     m_vds = make_mask("variable_density", shape, R=4, center_frac=0.15)
     stats_vds = achieved_acceleration(m_vds)
