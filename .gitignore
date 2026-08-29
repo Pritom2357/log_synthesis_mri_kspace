@@ -4,4 +4,6 @@ scratch/
 *.pyc
 docs/guide/*.aux
 docs/guide/
+docs/walkthrough/
 animations/
+*.tex

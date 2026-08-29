@@ -30,7 +30,7 @@ def _gaussian_window(shape:tuple[int, int], sigma:float=0.35):
 
 def make_window(kind:str, shape:tuple[int, int], **kw)->np.ndarray:
     """kind: ’none’|’hamming’|’gaussian’"""
-    kind_norm = kind.strip().lower
+    kind_norm = kind.strip().lower()
     if kind_norm == "none":
         return np.ones(shape, dtype=np.float64)
     elif kind_norm == "hamming":
