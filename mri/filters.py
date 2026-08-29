@@ -1,0 +1,63 @@
+"""
+Apodization windows and thermal noise.
+"""
+
+from __future__ import annotations
+import numpy as np
+
+from mri.kspace_core import radius_grid
+
+__all__ = ["make_window", "apply_window", "add_noise"]
+
+
+def __hamming_window(shape:tuple[int, int])->np.ndarray:
+    """2D Hamming, built as the outer product of two 1D raised cosines."""
+    rows, cols = shape
+    u = np.arange(rows) - rows//2
+    v = np.arange(cols) - cols//2
+    wu = 0.54 + 0.46*np.cos(np.pi*u/(rows/2))
+    wv = 0.54 + 0.46*np.cos(np.pi*v/(cols/2))
+    return np.outer(wu, wv)
+
+def _gaussian_window(shape:tuple[int, int], sigma:float=0.35):
+    """2D Gaussian, radially symmetric, sigma in normalised radius."""
+    if sigma <= 0:
+        raise ValueError("sigma must be positive")
+
+    rows, cols = shape
+    r = radius_grid(shape)/(min(rows, cols)/2)
+    return np.exp(-(r**2)/(2*sigma**2))
+
+def make_window(kind:str, shape:tuple[int, int], **kw)->np.ndarray:
+    """kind: ’none’|’hamming’|’gaussian’"""
+    kind_norm = kind.strip().lower()
+    if kind_norm == "none":
+        return np.ones(shape, dtype=np.float64)
+    elif kind_norm == "hamming":
+        return __hamming_window(shape)
+    elif kind_norm == "gaussian":
+        return _gaussian_window(shape, **kw)
+    else:
+        raise ValueError(
+            f"Unknown window kind: {kind!r}. Expected: none, hamming, gaussian."
+        )
+
+def apply_window(k:np.ndarray, kind:str, **kw)->np.ndarray:
+    """Multiplies the window element-wise into centred k-space."""
+    return k*make_window(kind, k.shape, **kw)
+
+def add_noise(k:np.ndarray, sigma:float, seed:int|None=None)->np.ndarray:
+    """
+    Adds complex Gaussian noise. sigma is a fraction of the mean k-space
+    magnitude, so the same slider value means the same visible grain on any
+    image. sigma=0 returns k untouched.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if sigma == 0:
+        return k
+
+    rng = np.random.default_rng(seed)
+    scale = sigma * float(np.abs(k).mean())
+    noise = rng.normal(0.0, scale, k.shape) + 1j*rng.normal(0.0, scale, k.shape)
+    return k+noise
