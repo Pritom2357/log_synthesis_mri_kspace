@@ -24,7 +24,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter,
+from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QScrollArea,
                                QFileDialog, QMessageBox)
 
 from mri.kspace_core import load_phantom, load_image
@@ -43,8 +43,12 @@ class Worker(QThread):
         self.img, self.settings = img, settings
 
     def run(self):
+        import time
         try:
-            self.done.emit(reconstruct(self.img, self.settings))
+            t0 = time.perf_counter()
+            out = reconstruct(self.img, self.settings)
+            out["_ms"] = int((time.perf_counter() - t0) * 1000)
+            self.done.emit(out)
         except Exception as e:  # surface, never crash the GUI thread
             self.done.emit({"exception": str(e)})
 
@@ -56,11 +60,12 @@ class Main(QMainWindow):
         self.image = load_phantom()
         self.worker = None
         self.pending = None  # latest settings that arrived while busy
+        self.elapsed_ms = 0
 
     # --- panels ---
         fig = Figure(figsize=(7.6, 7.2), facecolor="#1e1e1e")
         self.canvas = FigureCanvasQTAgg(fig)
-        titles = ["original", "sampled k-space", "reconstruction", "|error|"]
+        titles = ["reference", "sampled k-space", "reconstruction", "|error| (black = perfect)"]
         cmaps = ["gray", "magma", "gray", "magma"]
         self.artists = []
         for i, (t, cm) in enumerate(zip(titles, cmaps)):
@@ -71,11 +76,14 @@ class Main(QMainWindow):
         fig.tight_layout()
 
         self.controls = Controls()
-        self.controls.setMinimumWidth(280)
+        panel = QScrollArea()  # the panel is taller than most windows now
+        panel.setWidget(self.controls)
+        panel.setWidgetResizable(True)
+        panel.setMinimumWidth(300)
 
         split = QSplitter(Qt.Horizontal)  # drag the handle to resize either side
         split.addWidget(self.canvas)
-        split.addWidget(self.controls)
+        split.addWidget(panel)
         split.setStretchFactor(0, 1)
         split.setSizes([880, 340])
         self.setCentralWidget(split)
@@ -101,18 +109,24 @@ class Main(QMainWindow):
         self.worker.start()
 
     def _show(self, out: dict):
+        self.elapsed_ms = out.pop("_ms", 0)
         if "exception" in out:
             self.statusBar().showMessage(f"error: {out['exception']}")
         else:
-            self.artists[0].set_data(self.image)
-            self.artists[1].set_data(out["kspace"])
-            self.artists[2].set_data(out["recon"])
-            self.artists[3].set_data(out["error"] / max(out["error"].max(), 1e-12))
+            # Reduced FOV and k-space cropping change the output size, so the
+            # panels are re-created rather than updated when the shape changes.
+            panels = [out["reference"], out["kspace"], out["recon"],
+                      out["error"] / max(out["error"].max(), 1e-12)]
+            for art, data in zip(self.artists, panels):
+                if art.get_array().shape != data.shape:
+                    art.set_extent((-0.5, data.shape[1] - 0.5, data.shape[0] - 0.5, -0.5))
+                art.set_data(data)
             self.canvas.draw_idle()
             m = out["metrics"]
             psnr = "inf" if m["psnr"] == float("inf") else f"{m['psnr']:.2f} dB"
             self.statusBar().showMessage(
-                f"PSNR {psnr}    SSIM {m['ssim']:.4f}    MSE {m['mse']:.5f}")
+                f"PSNR {psnr}    SSIM {m['ssim']:.4f}    MSE {m['mse']:.5f}"
+                f"    [{out['recon'].shape[0]}x{out['recon'].shape[1]}, {self.elapsed_ms} ms]")
         if self.pending is not None:  # a slider moved while we were busy
             self.pending = None
             self._run()
@@ -174,7 +188,47 @@ if __name__ == "__main__":
         wait_done()
         assert "PSNR" in win.statusBar().currentMessage()
 
-        print("SELFTEST PASSED - panels update, worker runs, metrics shown")
+        # motion, compressed sensing and a reduced field of view
+        win.controls.sampling.setCurrentText("cartesian")
+        win.controls.motion.setCurrentText("periodic")
+        win.controls.motion_amp.setValue(5)
+        win.timer.stop(); win._run(); wait_done()
+        assert "PSNR" in win.statusBar().currentMessage()
+
+        win.controls.motion.setCurrentText("none")
+        win.controls.motion_amp.setValue(0)
+        win.controls.mask.setCurrentText("random")
+        win.controls.R.setValue(4)
+        win.controls.recon.setCurrentText("compressed sensing")
+        win.timer.stop(); win._run(); wait_done()
+        assert "PSNR" in win.statusBar().currentMessage()
+
+        win.controls.recon.setCurrentText("zero-filled")
+        win.controls.fov.setCurrentText("2")
+        win.timer.stop(); win._run(); wait_done()
+        shape = win.artists[2].get_array().shape
+        assert shape == (128, 128), f"reduced FOV should halve the output, got {shape}"
+
+        # cropping k-space must NOT resize anything: same FOV, same grid
+        win.controls.fov.setCurrentText("1")
+        win.controls.crop.setCurrentText("4")
+        win.timer.stop(); win._run(); wait_done()
+        assert win.artists[2].get_array().shape == (256, 256), "crop must not resize the output"
+
+        # rows hide themselves when the mode cannot use them
+        c = win.controls
+        assert c.form.isRowVisible(c.rows["R"]) and not c.form.isRowVisible(c.rows["spokes"])
+        c.sampling.setCurrentText("radial")
+        assert c.form.isRowVisible(c.rows["spokes"]) and not c.form.isRowVisible(c.rows["R"])
+        assert c.form.isRowVisible(c.rows["order"]) and not c.form.isRowVisible(c.rows["arms"])
+        c.sampling.setCurrentText("spiral")
+        assert c.form.isRowVisible(c.rows["arms"]) and not c.form.isRowVisible(c.rows["order"])
+        assert not c.form.isRowVisible(c.rows["sigma"])
+        c.window.setCurrentText("gaussian")
+        assert c.form.isRowVisible(c.rows["sigma"]), "sigma must appear for the gaussian window"
+        win.timer.stop(); win._run(); wait_done()
+
+        print("SELFTEST PASSED - panels update, worker runs, motion/cs/fov all wired")
         QTimer.singleShot(0, app.quit)
 
     sys.exit(app.exec())

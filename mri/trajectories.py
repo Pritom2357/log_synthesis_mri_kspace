@@ -14,11 +14,19 @@ def _ramp_weights(r:np.ndarray, n_arms:int)->np.ndarray:
     w[w<floor] = floor
     return w/w.max()
 
-def radial(shape:tuple[int, int], n_spokes:int=64, n_samples:int|None=None):
+GOLDEN_ANGLE = np.pi/((1+np.sqrt(5))/2) # ~111.25 deg, the standard radial view increment
+
+def radial(shape:tuple[int, int], n_spokes:int=64, n_samples:int|None=None,
+           order:str="sequential"):
     """
     Radial spokes through the centre of k-space.
     Returns (coords, weights). coords is (N,2) of (row,col) offsets from the
     centre in pixels; weights is the matching density compensation ramp.
+
+    order: 'sequential' sweeps the angles in order; 'golden' advances by the
+    golden angle each shot. The spokes end up in the same places either way,
+    but the ORDER is the order they are acquired in, so it decides whether
+    smooth patient motion lands coherently or incoherently in k-space.
     """
 
     rows, cols = shape
@@ -27,7 +35,14 @@ def radial(shape:tuple[int, int], n_spokes:int=64, n_samples:int|None=None):
 
     kmax = min(rows, cols)/2.0
     r = np.linspace(-kmax, kmax, n_samples)
-    theta = np.arange(n_spokes)*np.pi/n_spokes
+
+    order_norm = order.strip().lower() # input handling
+    if order_norm == "sequential":
+        theta = np.arange(n_spokes)*np.pi/n_spokes
+    elif order_norm == "golden":
+        theta = (np.arange(n_spokes)*GOLDEN_ANGLE) % np.pi
+    else:
+        raise ValueError(f"Unknown order: {order!r}. Expected: sequential, golden.")
 
     ky = np.outer(np.sin(theta), r).ravel()
     kx = np.outer(np.cos(theta), r).ravel()
