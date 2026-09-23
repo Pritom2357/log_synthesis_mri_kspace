@@ -24,6 +24,32 @@ def _uniform_mask(shape:tuple[int,int],R:int)->np.ndarray:
     mask[(rows//2)%R::R,:] = 1
     return mask
 
+def _nyquist_mask(shape:tuple[int,int],R:int,rate:float=1.0)->np.ndarray:
+    """
+    Keeps a given FRACTION of the phase-encode lines, spaced as evenly as possible.
+
+    This is the sampling theorem stated the way the lecture states it: rate is
+    the sampling rate as a fraction of the Nyquist rate. At rate=1.0 every line
+    is measured and the reconstruction is exact. Below 1.0 the spacing dk grows,
+    the field of view 1/dk shrinks, and whatever no longer fits folds back in.
+
+    Unlike keeping every R-th line, the fraction is continuous, so the aliasing
+    builds up gradually instead of jumping straight to full-strength copies. The
+    DC line is always kept, because it carries the mean brightness.
+    """
+    rows,_ = shape
+    if not 0 < rate <= 1.0:
+        raise ValueError("rate must be in (0, 1]")
+
+    n_keep = max(1,int(round(rate*rows)))
+    centre = rows//2
+    offsets = np.round(np.arange(n_keep)*rows/n_keep).astype(int)
+    keep = (centre + offsets) % rows # anchored on DC, then spread evenly
+
+    mask = np.zeros(shape,dtype=np.uint8)
+    mask[np.unique(keep),:] = 1
+    return mask
+
 def _variable_density_mask(shape:tuple[int,int],R:int,center_frac:float=0.15,periphery:str = "uniform",seed:int|None=None)->np.ndarray:
     rows,_ = shape
     mask = np.zeros(shape,dtype=np.uint8)
@@ -93,7 +119,7 @@ def make_mask(kind:str,shape:tuple[int,int],R:int,**kw)->np.ndarray:
     """
     Generates binary k-space sampling mask
 
-    kind: 'uniform'|'variable_density'/'vds'|'random'|'corner_cut'/'circular'
+    kind: 'nyquist'|'uniform'|'variable_density'/'vds'|'random'|'corner_cut'/'circular'
     shape: (rows,cols)
     R: acceleration factor (changes due to implementation)
     **kw: arguments forwarded to mask builders above
@@ -103,7 +129,9 @@ def make_mask(kind:str,shape:tuple[int,int],R:int,**kw)->np.ndarray:
     _validate_shape_R(shape,R)
 
     kind_norm = kind.strip().lower() # input handling
-    if kind_norm == "uniform":
+    if kind_norm == "nyquist":
+        return _nyquist_mask(shape, R, **kw)
+    elif kind_norm == "uniform":
         return _uniform_mask(shape, R)
     elif kind_norm in ("variable_density", "vds"):
         return _variable_density_mask(shape, R, **kw)
@@ -114,7 +142,7 @@ def make_mask(kind:str,shape:tuple[int,int],R:int,**kw)->np.ndarray:
     else:
         raise ValueError(
             f"Unknown mask kind: {kind!r}. "
-            "Expected one of: uniform, variable_density/vds, random, corner_cut/circular."
+            "Expected one of: nyquist, uniform, variable_density/vds, random, corner_cut/circular."
         )
     
 def achieved_acceleration(mask:np.ndarray)->dict:
@@ -157,6 +185,27 @@ if __name__ == "__main__":
     assert abs(stats["R_actual"] - 2.0) < 1e-9, stats
     print(f"[uniform R=2]        rows_set={rows_set:3d}  R_actual={stats['R_actual']:.3f}  frac={stats['fraction_sampled']:.3f}")
  
+    # --- Sampling rate: at Nyquist it is exact, below it aliases gradually ---
+    prev = 0
+    for rate in (0.25, 0.5, 0.75, 0.9, 1.0):
+        m_n = make_mask("nyquist", shape, R=1, rate=rate)
+        kept = int(np.count_nonzero(m_n[:, 0]))
+        assert m_n[shape[0] // 2, 0] == 1, f"rate={rate} dropped the DC line"
+        assert kept >= prev, "a higher rate must never keep fewer lines"
+        assert abs(kept / shape[0] - rate) < 0.02, f"rate={rate} kept {kept}/{shape[0]}"
+        prev = kept
+        print(f"[nyquist {rate:.2f}]      {kept:3d}/{shape[0]} lines kept, DC included")
+    assert np.all(make_mask("nyquist", shape, R=1, rate=1.0) == 1), "rate 1.0 keeps everything"
+
+    for bad in (0.0, -0.5, 1.5):
+        try:
+            make_mask("nyquist", shape, R=1, rate=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"rate {bad} should have raised")
+    print("[nyquist]            rate outside (0,1] rejected")
+
     # --- The DC row must survive at every R, not just the even ones ---
     for R in range(1, 9):
         m_r = make_mask("uniform", shape, R=R)

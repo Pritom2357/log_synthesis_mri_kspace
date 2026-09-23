@@ -7,3 +7,11 @@ docs/guide/
 docs/walkthrough/
 animations/
 *.tex
+# raw MRI datasets are gigabytes; never commit them -- but the README that
+# says where they came from and under what licence has to travel with the code,
+# so re-admit just that one file. Git will not look inside an ignored directory
+# at all, which is why the directories are unignored a level at a time.
+data/*
+!data/raw/
+data/raw/*
+!data/raw/README.md

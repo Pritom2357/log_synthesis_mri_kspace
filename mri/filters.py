@@ -43,8 +43,13 @@ def make_window(kind:str, shape:tuple[int, int], **kw)->np.ndarray:
         )
 
 def apply_window(k:np.ndarray, kind:str, **kw)->np.ndarray:
-    """Multiplies the window element-wise into centred k-space."""
-    return k*make_window(kind, k.shape, **kw)
+    """
+    Multiplies the window element-wise into centred k-space.
+
+    Built on the last two axes only, so multi-coil k-space of shape
+    (coils, ky, kx) broadcasts: every channel gets the same window.
+    """
+    return k*make_window(kind, k.shape[-2:], **kw)
 
 def add_noise(k:np.ndarray, sigma:float, seed:int|None=None)->np.ndarray:
     """
