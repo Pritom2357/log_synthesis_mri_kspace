@@ -50,53 +50,6 @@ def _nyquist_mask(shape:tuple[int,int],R:int,rate:float=1.0)->np.ndarray:
     mask[np.unique(keep),:] = 1
     return mask
 
-def _variable_density_mask(shape:tuple[int,int],R:int,center_frac:float=0.15,periphery:str = "uniform",seed:int|None=None)->np.ndarray:
-    rows,_ = shape
-    mask = np.zeros(shape,dtype=np.uint8)
-
-    center_width = max(1,int(round(center_frac*rows)))
-    center_start = rows//2 - center_width//2
-    center_end = center_start + center_width
-    mask[center_start:center_end,:] = 1
-
-    if periphery == "random":
-        rng = np.random.default_rng(seed)
-        row_keep = rng.random(rows) < (1.0/R)
-        mask[row_keep,:] = 1
-    elif periphery == "uniform":
-        mask[(rows//2)%R::R,:] = 1
-    else:
-        raise ValueError(f"Unknown periphery mode:{periphery!r}")
-    
-    return mask
-
-def _random_mask(shape:tuple[int,int],R:int,seed:int|None=None)->np.ndarray:
-    """ Keeping each row with 1/R probability (Bernoulli sampling)"""
-    rows,_ = shape
-    rng = np.random.default_rng(seed)
-    row_keep = rng.random(rows) < (1.0/R)
-    mask = np.zeros(shape,dtype=np.uint8)
-    mask[row_keep,:] = 1
-    return mask
-
-def _corner_cut_mask(shape:tuple[int,int],R:int,r_max:float|None=None)->np.ndarray:
-    """
-    Circular low pass mask: keeps inside: zeros outside
-    
-    If r_max is not given, the area fraction is approx. 1/R -> an approx. acceleration factor of R
-    r_max is in pixels.
-    """
-    rows,cols = shape
-    cy,cx = rows//2 , cols//2 # center
-    
-    if r_max is None:
-        r_max = np.sqrt((rows * cols) / (np.pi * R))
-    
-    Y,X = np.ogrid[:rows,:cols]
-    dist = np.sqrt((Y-cy)**2 + (X-cx)**2)
-
-    mask = (dist<= r_max).astype(np.uint8)
-    return mask
 # ------
 # Helper
 # ------
@@ -119,7 +72,9 @@ def make_mask(kind:str,shape:tuple[int,int],R:int,**kw)->np.ndarray:
     """
     Generates binary k-space sampling mask
 
-    kind: 'nyquist'|'uniform'|'variable_density'/'vds'|'random'|'corner_cut'/'circular'
+    kind: 'nyquist'|'uniform'. Only regular, evenly spaced sampling is kept:
+          it is the sampling the course teaches, and the one real Cartesian
+          scanners use. Random and variable-density patterns were removed.
     shape: (rows,cols)
     R: acceleration factor (changes due to implementation)
     **kw: arguments forwarded to mask builders above
@@ -133,16 +88,10 @@ def make_mask(kind:str,shape:tuple[int,int],R:int,**kw)->np.ndarray:
         return _nyquist_mask(shape, R, **kw)
     elif kind_norm == "uniform":
         return _uniform_mask(shape, R)
-    elif kind_norm in ("variable_density", "vds"):
-        return _variable_density_mask(shape, R, **kw)
-    elif kind_norm == "random":
-        return _random_mask(shape, R, **kw)
-    elif kind_norm in ("corner_cut", "circular"):
-        return _corner_cut_mask(shape, R, **kw)
     else:
         raise ValueError(
             f"Unknown mask kind: {kind!r}. "
-            "Expected one of: nyquist, uniform, variable_density/vds, random, corner_cut/circular."
+            "Expected one of: nyquist, uniform."
         )
     
 def achieved_acceleration(mask:np.ndarray)->dict:
@@ -213,26 +162,6 @@ if __name__ == "__main__":
         assert abs(achieved_acceleration(m_r)["R_actual"] - R) < 0.1, f"R={R} drifted"
     print("[uniform R=1..8]     DC row kept at every R, R_actual within 0.1")
 
-    # --- Variable density: center should be denser than a plain uniform mask ---
-    m_vds = make_mask("variable_density", shape, R=4, center_frac=0.15)
-    stats_vds = achieved_acceleration(m_vds)
-    center_band = m_vds[shape[0] // 2 - 5: shape[0] // 2 + 5, 0]
-    assert np.all(center_band == 1), "Center band of VDS mask must be fully sampled"
-    print(f"[variable_density R=4] R_actual={stats_vds['R_actual']:.3f}  frac={stats_vds['fraction_sampled']:.3f}")
- 
-    # --- Random: reproducible with a seed ---
-    m_rand_a = make_mask("random", shape, R=4, seed=42)
-    m_rand_b = make_mask("random", shape, R=4, seed=42)
-    assert np.array_equal(m_rand_a, m_rand_b), "Same seed must give same random mask"
-    stats_rand = achieved_acceleration(m_rand_a)
-    print(f"[random R=4, seed=42]  R_actual={stats_rand['R_actual']:.3f}  frac={stats_rand['fraction_sampled']:.3f}")
- 
-    # --- Corner cut: symmetric circular region, roughly matches requested R ---
-    m_corner = make_mask("corner_cut", shape, R=4)
-    stats_corner = achieved_acceleration(m_corner)
-    print(f"[corner_cut R=4]       R_actual={stats_corner['R_actual']:.3f}  frac={stats_corner['fraction_sampled']:.3f}")
-    assert m_corner[shape[0] // 2, shape[1] // 2] == 1, "Center of k-space must always be sampled"
- 
     # --- Identity check: full sampling (R=1 uniform) keeps everything ---
     m_full = make_mask("uniform", shape, R=1)
     assert np.all(m_full == 1), "R=1 uniform mask must be all-ones"

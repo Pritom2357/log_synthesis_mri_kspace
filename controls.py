@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (QWidget, QFormLayout, QComboBox, QSlider,
                                QSpinBox, QDialogButtonBox)
 
 # The dropdowns say it in full; the pipeline wants the short key.
-RECON_LABELS = {"zero-filled": "zero_filled", "compressed sensing": "cs"}
+KEEP_LABELS = {"magnitude and phase": "both", "magnitude only": "magnitude",
+               "phase only": "phase"}
 INTERP_LABELS = {
     "sinc (ideal)": "sinc",
     "linear": "linear",
@@ -34,12 +35,10 @@ INTERP_LABELS = {
 #   name -> (row label, lowest allowed, highest allowed)
 LIMITS = {
     "rate":      ("sampling rate",      1,  100),   # rate must be in (0, 1]
-    "spokes":    ("spokes",             1, 2048),
-    "arms":      ("spiral arms",        1,  512),
     "sigma":     ("window sigma",       1,  500),   # sigma must be positive
-    "noise":     ("noise",              0,  500),
-    "low_pass":  ("low pass radius",    0,  512),
-    "high_pass": ("high pass radius",   0,  512),
+    "noise":     ("add noise",          0,  500),
+    "nfloor":    ("noise-floor filter", 0,  500),   # strength must be non-negative
+    "sharpen":   ("sharpen",            0,  500),
     "dc":        ("DC term",            0, 1000),   # scale must be non-negative
     "spike":     ("spike offset",       0,  255),   # must land inside k-space
     "erase":     ("erase centre",       0,  512),
@@ -121,18 +120,18 @@ class Controls(QWidget):
         self.load_btn = QPushButton("Load raw k-space...")
         self.phantom_btn = QPushButton("Phantom")
 
-        self.sampling = QComboBox(); self.sampling.addItems(["cartesian", "radial", "spiral"])
-        self.mask = QComboBox(); self.mask.addItems(
-            ["nyquist", "uniform", "variable_density", "random", "corner_cut"])
-        self.rate, self.rate_lbl = self._slider(20, 100, 100)     # /100 -> x Nyquist
-        self.spokes, self.spokes_lbl = self._slider(16, 256, 64)
-        self.arms, self.arms_lbl = self._slider(4, 32, 16)
+        self.rate, self.rate_lbl = self._slider(20, 100, 100)     # /100 -> x Nyquist rate
 
+        # Denoising. The repetition count is filled in by app.py once it knows
+        # how many scans of this slice exist on disk.
+        self.average = QComboBox(); self.average.addItem("1  (this scan only)")
+        # Alignment is always on: without it, averaging can cancel the anatomy
+        # instead of the noise (see mri/denoise.py).
+        self.nfloor, self.nfloor_lbl = self._slider(0, 300, 0)    # /100 -> strength
+        self.sharpen, self.sharpen_lbl = self._slider(0, 100, 0)  # /100 -> amount
         self.window = QComboBox(); self.window.addItems(["none", "hamming", "gaussian"])
         self.sigma, self.sigma_lbl = self._slider(5, 100, 35)     # /100
         self.noise, self.noise_lbl = self._slider(0, 30, 0)       # /100
-        self.low_pass, self.low_pass_lbl = self._slider(0, 128, 0)   # radius, 0 = off
-        self.high_pass, self.high_pass_lbl = self._slider(0, 128, 0)
 
         self.dc, self.dc_lbl = self._slider(0, 200, 100)          # /100 -> DC multiplier
         self.spike, self.spike_lbl = self._slider(0, 60, 0)       # columns off centre
@@ -140,8 +139,8 @@ class Controls(QWidget):
         self.pf, self.pf_lbl = self._slider(50, 100, 100)         # /100 -> fraction kept
         self.pf_fill = QCheckBox("rebuild the rest from Hermitian symmetry")
         self.pf_fill.setChecked(True)
+        self.keep = QComboBox(); self.keep.addItems(list(KEEP_LABELS))
 
-        self.recon = QComboBox(); self.recon.addItems(list(RECON_LABELS))
         self.upscale = QComboBox(); self.upscale.addItems(["1", "2", "4"])
         self.interp = QComboBox(); self.interp.addItems(list(INTERP_LABELS))
 
@@ -174,20 +173,17 @@ class Controls(QWidget):
         ]), "1 · Data source")
 
         box.addItem(self._page([
-            ("sampling", "trajectory", self.sampling),
-            ("mask", "pattern", self.mask),
-            ("rate", "sampling rate", self._slider_row(self.rate, self.rate_lbl)),
-            ("spokes", "spokes", self._slider_row(self.spokes, self.spokes_lbl)),
-            ("arms", "spiral arms", self._slider_row(self.arms, self.arms_lbl)),
-        ]), "2 · Sampling  (Nyquist–Shannon)")
+            ("rate", "sampling rate  (x Nyquist rate)", self._slider_row(self.rate, self.rate_lbl)),
+        ]), "2 · Sampling")
 
         box.addItem(self._page([
+            ("average", "repetitions averaged", self.average),
+            ("nfloor", "noise-floor filter", self._slider_row(self.nfloor, self.nfloor_lbl)),
             ("window", "apodization", self.window),
             ("sigma", "window sigma", self._slider_row(self.sigma, self.sigma_lbl)),
+            ("sharpen", "sharpen (unsharp mask)", self._slider_row(self.sharpen, self.sharpen_lbl)),
             ("noise", "add noise", self._slider_row(self.noise, self.noise_lbl)),
-            ("low_pass", "low pass radius", self._slider_row(self.low_pass, self.low_pass_lbl)),
-            ("high_pass", "high pass radius", self._slider_row(self.high_pass, self.high_pass_lbl)),
-        ]), "3 · Filtering & noise")
+        ]), "3 · Denoising")
 
         box.addItem(self._page([
             ("dc", "DC term", self._slider_row(self.dc, self.dc_lbl)),
@@ -195,13 +191,13 @@ class Controls(QWidget):
             ("erase", "erase centre", self._slider_row(self.erase, self.erase_lbl)),
             ("pf", "partial Fourier", self._slider_row(self.pf, self.pf_lbl)),
             ("pf_fill", None, self.pf_fill),
+            ("keep", "k-space keeps", self.keep),
         ]), "4 · k-space edits")
 
         box.addItem(self._page([
-            ("recon", "method", self.recon),
             ("upscale", "upscale by", self.upscale),
             ("interp", "interpolation", self.interp),
-        ]), "5 · Reconstruction & resolution")
+        ]), "5 · Resolution")
 
         box.addItem(self._page([
             ("wl_centre", "level (centre)", self._slider_row(self.wl_centre, self.wl_centre_lbl)),
@@ -214,11 +210,11 @@ class Controls(QWidget):
         outer.addWidget(box)
 
         # ---------------- wiring ----------------
-        for combo in (self.source, self.sampling, self.mask, self.window,
-                      self.recon, self.upscale, self.interp):
+        for combo in (self.source, self.average, self.window, self.keep,
+                      self.upscale, self.interp):
             combo.currentTextChanged.connect(self._emit)
-        for slider in (self.rate, self.sigma, self.noise, self.spokes, self.arms,
-                       self.slice_idx, self.low_pass, self.high_pass,
+        for slider in (self.rate, self.sigma, self.noise, self.nfloor, self.sharpen,
+                       self.slice_idx,
                        self.dc, self.spike, self.erase, self.pf):
             slider.valueChanged.connect(self._emit)
         self.pf_fill.toggled.connect(self._emit)
@@ -289,19 +285,16 @@ class Controls(QWidget):
         """
         Hides every row the current mode would ignore.
 
-        Cartesian sampling reads the pattern, and the sampling rate applies only
-        to the nyquist pattern. Radial reads the spoke count, spiral the arm
-        count. Window sigma is read only by the gaussian window, the Hermitian
-        checkbox only matters once partial Fourier is actually on, and the
-        interpolation method only matters once you are upscaling.
+        Averaging needs more than one scan of the slice. Adding noise is for the phantom only: a real scan already
+        carries its own. Window sigma is read only by the gaussian window, the
+        Hermitian checkbox only matters once partial Fourier is actually on,
+        and the interpolation method only matters once you are upscaling.
         """
-        samp = self.sampling.currentText()
+        real = self.source.currentIndex() > 0              # index 0 is the phantom
         for name, shown in {
-            "slice_idx": self.source.currentIndex() > 0,   # index 0 is the phantom
-            "mask":      samp == "cartesian",
-            "rate":      samp == "cartesian" and self.mask.currentText() == "nyquist",
-            "spokes":    samp == "radial",
-            "arms":      samp == "spiral",
+            "slice_idx": real,
+            "average":   real and self.average.count() > 1,
+            "noise":     not real,
             "sigma":     self.window.currentText() == "gaussian",
             "pf_fill":   self.pf.value() < 100,
             "interp":    self.upscale.currentText() != "1",
@@ -311,6 +304,16 @@ class Controls(QWidget):
     # ------
     # State
     # ------
+
+    def set_repetitions(self, n: int) -> None:
+        """How many scans of this slice exist; offers 1..n to average."""
+        self.average.blockSignals(True)
+        self.average.clear()
+        self.average.addItem("1  (this scan only)")
+        for i in range(2, n + 1):
+            self.average.addItem(f"{i}  (this scan + {i-1} more)")
+        self.average.blockSignals(False)
+        self._update_visibility()
 
     def display_range(self) -> tuple[float, float]:
         """(vmin, vmax) for the reconstruction panel, from the centre and width."""
@@ -330,20 +333,19 @@ class Controls(QWidget):
 
     def settings(self) -> dict:
         """Current state of every knob, in pipeline.reconstruct's vocabulary."""
+        real = self.source.currentIndex() > 0
         return {
-            "sampling": self.sampling.currentText(),
-            "mask": self.mask.currentText(),
-            "R": 1,                                  # kept for the non-nyquist patterns
             "rate": self.rate.value() / 100.0,
+            "average": self.average.currentIndex() + 1,
+            "noise_filter": self.nfloor.value() / 100.0,
+            "sharpen": self.sharpen.value() / 100.0,
             "window": self.window.currentText(),
             "sigma": self.sigma.value() / 100.0,
-            "noise": self.noise.value() / 100.0,
-            "seed": 0,           # fixed, so random patterns and noise stay comparable
-            "n_spokes": self.spokes.value(),
-            "n_interleaves": self.arms.value(),
-            "recon": RECON_LABELS[self.recon.currentText()],
-            "low_pass": self.low_pass.value(),
-            "high_pass": self.high_pass.value(),
+            # A real scan brings its own noise; the slider is hidden then, and a
+            # value left over from the phantom must not leak into it.
+            "noise": 0.0 if real else self.noise.value() / 100.0,
+            "seed": 0,           # fixed, so the added noise stays comparable
+            "keep": KEEP_LABELS[self.keep.currentText()],
             "dc_scale": self.dc.value() / 100.0,
             "spike": self.spike.value(),
             "erase": self.erase.value(),
@@ -357,14 +359,12 @@ class Controls(QWidget):
         self.rate_lbl.setText(f"{self.rate.value()/100:.2f}")
         self.sigma_lbl.setText(f"{self.sigma.value()/100:.2f}")
         self.noise_lbl.setText(f"{self.noise.value()/100:.2f}")
-        self.spokes_lbl.setText(str(self.spokes.value()))
-        self.arms_lbl.setText(str(self.arms.value()))
+        for sl, lbl in ((self.nfloor, self.nfloor_lbl), (self.sharpen, self.sharpen_lbl)):
+            lbl.setText("off" if sl.value() == 0 else f"{sl.value()/100:.2f}")
         self.slice_lbl.setText(str(self.slice_idx.value()))
         self.dc_lbl.setText(f"{self.dc.value()/100:.2f}")
         self.pf_lbl.setText(f"{self.pf.value()/100:.2f}")
-        for sl, lbl in ((self.low_pass, self.low_pass_lbl),
-                        (self.high_pass, self.high_pass_lbl),
-                        (self.spike, self.spike_lbl),
+        for sl, lbl in ((self.spike, self.spike_lbl),
                         (self.erase, self.erase_lbl)):
             lbl.setText("off" if sl.value() == 0 else str(sl.value()))
         self._update_visibility()

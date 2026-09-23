@@ -100,24 +100,33 @@ def log_magnitude(k:np.ndarray)->np.ndarray:
     """
     return _normalize(np.log1p(np.abs(np.asarray(k))))
 
-def radius_grid(shape:tuple[int,int])->np.ndarray:
-    """Distance in pixels of every entry from the centre of the matrix."""
+def radius_grid(shape:tuple[int,int],centre:tuple[int,int]|None=None)->np.ndarray:
+    """
+    Distance in pixels of every entry from `centre`, the middle of the matrix
+    by default. Pass the real DC position for scanner data, where the two
+    differ by a few samples.
+    """
     rows,cols = shape
+    cy,cx = (rows//2,cols//2) if centre is None else centre
     Y,X = np.ogrid[:rows,:cols]
-    return np.hypot(Y-rows//2, X-cols//2)
+    return np.hypot(Y-cy, X-cx)
 
 def low_pass(k:np.ndarray,radius:float)->np.ndarray:
     """
-    Keeps the central disc of k-space, zeroing everything outside it.
+    Keeps the disc of k-space around the DC sample, zeroing everything outside.
 
-    The radius grid is built on the last two axes, so multi-coil k-space of
-    shape (coils, ky, kx) broadcasts and every channel is filtered the same.
+    Distance is measured from where the DC sample really is (dc_index), not
+    the array middle: on the scanner files here they are 3 to 8 rows apart,
+    and a small disc around the wrong point cuts the DC term out entirely.
+    The grid is built on the last two axes, so (coils, ky, kx) broadcasts.
     """
-    return np.where(radius_grid(k.shape[-2:]) <= radius, k, 0.0)
+    from mri.kspace_edit import dc_index # local: kspace_edit's tests import this module
+    return np.where(radius_grid(k.shape[-2:],dc_index(k)) <= radius, k, 0.0)
 
 def high_pass(k:np.ndarray,radius:float)->np.ndarray:
-    """Deletes the central disc and keeps the periphery. Coil-safe, as above."""
-    return np.where(radius_grid(k.shape[-2:]) > radius, k, 0.0)
+    """Deletes the disc around the DC sample and keeps the rest. Coil-safe, as above."""
+    from mri.kspace_edit import dc_index
+    return np.where(radius_grid(k.shape[-2:],dc_index(k)) > radius, k, 0.0)
 
 # -------------------------------
 # Tests for kspace_core.py only

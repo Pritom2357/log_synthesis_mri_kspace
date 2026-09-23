@@ -33,11 +33,8 @@ DEFAULT_SLICE = 12
 GRID = {
     "window":   ["none", "hamming", "gaussian"],
     "sigma":    [0.35, 0.45, 0.55, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.00, 1.20, 1.50],
-    "low_pass": [0, 90, 100, 110, 120, 128],
-    "high_pass": [0, 1, 2],
     "dc_scale": [0.85, 0.95, 1.00, 1.05, 1.15],
     "rate":     [1.00],
-    "mask":     ["nyquist"],
 }
 
 

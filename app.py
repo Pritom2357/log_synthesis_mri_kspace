@@ -4,7 +4,7 @@ MRI k-space simulator - the desktop app (Day 3).
     python app.py               # opens the window
     python app.py --selftest    # headless wiring check, exits 0 if sound
 
-Layout: four panels -- the k-space profile and the measured k-space side by
+Layout: four panels -- the scan and sampling facts and the measured k-space side by
 side on top, and below them the base reconstruction next to yours -- with the
 control panel beside them. The base is the same measured k-space put through
 the pipeline with every setting at its default, so it is not the hidden answer:
@@ -50,26 +50,28 @@ class Worker(QThread):
     """Runs one reconstruct() off the GUI thread and hands the dict back."""
     done = Signal(dict)
 
-    def __init__(self, img, settings, kspace=None, reference=None, base_key=None):
+    def __init__(self, img, settings, kspace=None, reference=None, base_key=None,
+                 repeats=None):
         super().__init__()
         self.img, self.settings = img, settings
-        self.kspace, self.reference = kspace, reference
+        self.kspace, self.reference, self.repeats = kspace, reference, repeats
         self.base_key = base_key   # not None means "also build the base image"
 
     def run(self):
         import time
         try:
             t0 = time.perf_counter()
-            out = reconstruct(self.img, self.settings,
-                              kspace=self.kspace, reference=self.reference)
+            out = reconstruct(self.img, self.settings, kspace=self.kspace,
+                              reference=self.reference, repeats=self.repeats)
             if self.base_key is not None:
                 # The same measurement with every knob at its default. Computed
                 # here rather than on the GUI thread, and only when the slice or
                 # the file changes -- it cannot move when a slider does, so
                 # rebuilding it on every drag would double the work for nothing.
-                out["base"] = reconstruct(self.img, dict(DEFAULTS),
-                                          kspace=self.kspace,
-                                          reference=self.reference)["recon"]
+                base = reconstruct(self.img, dict(DEFAULTS), kspace=self.kspace,
+                                   reference=self.reference)
+                out["base"] = base["recon"]
+                out["base_scores"] = (base["metrics"], base["sampling"])
                 out["base_key"] = self.base_key
             out["_ms"] = int((time.perf_counter() - t0) * 1000)
             self.done.emit(out)
@@ -87,8 +89,10 @@ class Main(QMainWindow):
         self.elapsed_ms = 0
         self.raw_path = None   # set when a real scan is selected
         self.raw_note = ""     # scanner description for the status bar
+        self.timing = None     # (TR in s, echo-train length) of a real scan
         self.ref_note = ""     # where the comparison image came from
         self.base = None       # this slice with nothing switched on
+        self.base_scores = None  # (metrics, sampling) of the base, for the deltas
         self._base_key = None  # what self.base was built from
         self._image_gen = 0    # bumped whenever a non-raw image is swapped in
 
@@ -103,35 +107,21 @@ class Main(QMainWindow):
         # The base panel is a different thing entirely and is allowed: it is
         # this same measured k-space with every setting left alone, so it gives
         # an edit something to be judged against without revealing the answer.
-        # The profile and k-space share the top row; the two reconstructions
+        # The facts and the k-space share the top row; the two reconstructions
         # share the bottom one, which is the taller of the two because they are
         # what the rest of the window exists to produce.
-        # Constrained layout, not tight_layout: the profile panel carries axis
-        # labels that the image panels do not, and its title is rewritten on
-        # every reconstruction. tight_layout is computed once at build time, so
-        # it knew nothing about those labels and let them collide with the
-        # panel below. Constrained layout re-solves on every draw.
+        # Constrained layout re-solves on every draw, so titles rewritten on
+        # every reconstruction never collide with the panel below.
         fig = Figure(figsize=(9.0, 8.4), facecolor="#1e1e1e", layout="constrained")
         self.canvas = FigureCanvasQTAgg(fig)
-        # Panel 0 is a 1D cut through k-space rather than another picture. A
-        # profile shows things a 2D view hides: where the peak really sits, how
-        # fast the signal falls away from it, and exactly which samples are
-        # missing. The blank white square it replaced said none of that.
+        # Panel 0 is the scorecard: five numbers, each next to how it moved
+        # against the base, so every knob can be judged the moment it moves.
         grid = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.6])
         self.axes, self.artists = [], []
         ax0 = fig.add_subplot(grid[0, 0])
-        ax0.set_facecolor("#111111")
-        ax0.tick_params(colors="#999999", labelsize=7)
-        for spine in ax0.spines.values():
-            spine.set_color("#555555")
-        ax0.set_title("k-space profile", color="white", fontsize=9)
-        ax0.set_xlabel("k-space column, relative to the array centre",
-                       color="#999999", fontsize=7)
-        self.profile_line, = ax0.plot([], [], color="#f0a030", lw=1.1)
-        self.centre_mark = ax0.axvline(0, color="#4da6ff", lw=1.0, ls="--")
-        self.peak_mark = ax0.axvline(0, color="#2ecc71", lw=1.0)
+        self._build_scorecard(ax0)
         self.axes.append(ax0)
-        self.artists.append(None)   # panel 0 is a line, not an image
+        self.artists.append(None)   # panel 0 is a table, not an image
 
         for t, cm, cell in (("measured k-space", "magma", grid[0, 1]),
                             ("base  (nothing switched on)", "gray", grid[1, 0]),
@@ -239,6 +229,8 @@ class Main(QMainWindow):
         if name == PHANTOM:
             self.raw_path, self.raw_note, self.ref_note = None, "", ""
             self.image = load_phantom()
+            self.timing = None
+            self.controls.set_repetitions(1)
         else:
             match = [f for f in self.datasets if f.name == name]
             if not match:
@@ -246,7 +238,11 @@ class Main(QMainWindow):
             self.raw_path = str(match[0])
             try:
                 info = raw_info(self.raw_path)
+                tr = info.get("TR_ms", float("nan"))
+                self.timing = ((tr/1000.0, max(1, info.get("echo_train_length", 1)))
+                               if tr == tr and tr > 0 else None)   # tr == tr: not NaN
                 n_reps = len(find_repetitions(self.raw_path))
+                self.controls.set_repetitions(n_reps)
                 self.raw_note = describe(self.raw_path) + (
                     f" | {n_reps} repetitions" if n_reps > 1 else " | single acquisition")
             except Exception as e:
@@ -290,8 +286,20 @@ class Main(QMainWindow):
             except Exception as e:
                 self.statusBar().showMessage(f"error reading slice {z}: {e}")
                 return
+            # Other scans of the same slice, loaded only when averaging asks
+            # for them: this scan first, then its siblings in file order.
+            repeats = None
+            if settings["average"] > 1:
+                others = [p for p in find_repetitions(self.raw_path)
+                          if Path(p).resolve() != Path(self.raw_path).resolve()]
+                try:
+                    repeats = [load_raw_kspace(p, z)
+                               for p in others[:settings["average"] - 1]]
+                except Exception as e:
+                    self.statusBar().showMessage(f"error reading a repetition: {e}")
+                    return
             self.worker = Worker(None, settings, kspace=k, reference=ref,
-                                 base_key=base_key)
+                                 base_key=base_key, repeats=repeats)
 
         self.worker.done.connect(self._show)
         self.worker.start()
@@ -321,8 +329,7 @@ class Main(QMainWindow):
             if "base" in out:
                 self.base = out["base"]
                 self._base_key = out["base_key"]
-
-            self._draw_profile(out["kspace"], out["mask"])
+                self.base_scores = out["base_scores"]
 
             panels = [out["kspace"],
                       self.base if self.base is not None else out["recon"],
@@ -332,22 +339,10 @@ class Main(QMainWindow):
                     art.set_extent((-0.5, data.shape[1] - 0.5, data.shape[0] - 0.5, -0.5))
                 art.set_data(data)
             self.canvas.draw_idle()
-            # Difference metrics are computed and kept in out["metrics"], but
-            # they are not shown: they only exist by comparing against the
-            # hidden reference, which is exactly what this view is not allowed
-            # to reveal.
-            mask = out["mask"]
-            kept = (f"{100*float(mask.mean()):.0f}% of k-space measured"
-                    if mask is not None else "non-Cartesian trajectory")
-            where = self.raw_note if self.raw_note else "simulated phantom"
-            if self.ref_note:
-                where += f"  |  ref: {self.ref_note}"
-            edits = self._active_edits()
-            if out.get("recon_used") == "zero_filled" and                     self.controls.settings()["recon"] == "cs":
-                edits += "    [compressed sensing needs single-coil data: zero-filled used]"
-            self.statusBar().showMessage(
-                f"{kept}    [{out['recon'].shape[0]}x{out['recon'].shape[1]},"
-                f" {self.elapsed_ms} ms]{edits}    |  {where}")
+            self._update_scorecard(out)
+            self.canvas.draw_idle()
+            self.status_text = self._status(out)
+            self.statusBar().showMessage(self.status_text)
 
         # A setting changed while this reconstruction was still running, so the
         # picture on screen is already out of date. Run once more with the
@@ -357,32 +352,122 @@ class Main(QMainWindow):
             self.pending = None
             self._run()
 
-    def _draw_profile(self, kdisp, mask):
+    # ------
+    # Scorecard
+    # ------
+
+    # name, how to print it, and whether a bigger number is the better one
+    _SCORES = (
+        ("Acceleration", lambda v: f"{v:.2f}\u00d7", True),
+        ("Scan time", None, False),                      # seconds, or % of a full scan
+        ("Aliasing loss", lambda v: f"{v:.1f} %", False),
+        ("SNR", lambda v: f"{v:.1f}", True),
+        ("SSIM", lambda v: f"{v:.3f}", True),
+        ("PSNR", lambda v: f"{v:.2f} dB", True),
+    )
+    _DELTA = {"Acceleration": "{:+.2f}\u00d7", "Aliasing loss": "{:+.1f} %",
+              "SNR": "{:+.1f}", "SSIM": "{:+.3f}", "PSNR": "{:+.2f} dB"}
+
+    def _build_scorecard(self, ax):
+        """A rounded box, a header, and one row per score at fixed positions."""
+        from matplotlib.patches import FancyBboxPatch
+        ax.axis("off")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.set_title("metrics", color="white", fontsize=9)
+        ax.add_patch(FancyBboxPatch((0.04, 0.04), 0.92, 0.9,
+                                    boxstyle="round,pad=0.0,rounding_size=0.04",
+                                    facecolor="#262626", edgecolor="#444444", lw=1.0))
+        head = dict(color="#8a8a8a", fontsize=9, va="center")
+        ax.text(0.10, 0.85, "metric", ha="left", **head)
+        ax.text(0.62, 0.85, "now", ha="right", **head)
+        ax.text(0.90, 0.85, "vs base", ha="right", **head)
+        ax.plot([0.08, 0.92], [0.785, 0.785], color="#444444", lw=0.8)
+        self.score_cells = {}
+        for i, (name, _, _) in enumerate(self._SCORES):
+            y = 0.70 - i*0.118
+            ax.text(0.10, y, name, ha="left", va="center", color="#cfcfcf", fontsize=11)
+            now = ax.text(0.62, y, "", ha="right", va="center", color="white",
+                          fontsize=12, family="monospace")
+            delta = ax.text(0.90, y, "", ha="right", va="center", color="#8a8a8a",
+                            fontsize=10, family="monospace")
+            self.score_cells[name] = (now, delta)
+        self.info_text = ""
+
+    def _update_scorecard(self, out: dict):
         """
-        One horizontal cut through k-space, taken along the row that holds the
-        peak. Two vertical lines say where the peak is and where the middle of
-        the array is; on real scanner data those are several samples apart.
+        Fills the rows. The deltas are against the base panel, so green and
+        red say directly whether a change helped.
+
+            Acceleration  1 / the share of one full scan this run acquires:
+                          rows kept (sampling) x columns kept (partial Fourier)
+                          x scans averaged. Filters are free and never move it.
+            Scan time     one full scan's real duration, TR x ceil(lines /
+                          echo train) from the file, times the fraction of rows
+                          acquired. Without timing (the phantom) it is the
+                          percentage of one full scan.
+            Aliasing loss energy of the skipped samples / total (Parseval)
+            SNR           tissue / background noise, from the picture alone
+            SSIM, PSNR    against the reference: the average of the other
+                          repetitions for a scan, the image itself for the phantom
         """
-        import numpy as np
+        import math
 
-        peak_row, peak_col = np.unravel_index(int(np.argmax(kdisp)), kdisp.shape)
-        profile = kdisp[peak_row]
-        x = np.arange(len(profile)) - kdisp.shape[1] // 2
+        def scan_time(sampling):
+            if self.timing:
+                tr, train = self.timing
+                return tr*math.ceil(sampling["scanner_lines"]/train)*sampling["acquired"]
+            return 100*sampling["acquired"]
 
-        self.profile_line.set_data(x, profile)
-        self.centre_mark.set_xdata([0, 0])
-        offset = peak_col - kdisp.shape[1] // 2
-        self.peak_mark.set_xdata([offset, offset])
+        def scores(metrics, sampling):
+            return {"Acceleration": sampling["acceleration"],
+                    "Scan time": scan_time(sampling),
+                    "Aliasing loss": 100*sampling["alias_energy"],
+                    "SNR": metrics["snr"], "SSIM": metrics["ssim"], "PSNR": metrics["psnr"]}
 
-        ax = self.axes[0]
-        ax.set_xlim(x[0], x[-1])
-        ax.set_ylim(0, 1.05)
-        # Kept short on purpose: a long title overflows the axes on a narrow
-        # window and clips at the figure edge. The sampled percentage already
-        # appears in the status bar, so it does not need repeating here.
-        row_off = peak_row - kdisp.shape[0] // 2
-        ax.set_title(f"k-space profile  |  peak {row_off:+d},{offset:+d} from centre",
-                     color="white", fontsize=9)
+        now = scores(out["metrics"], out["sampling"])
+        base = scores(*self.base_scores) if self.base_scores else now
+        lines = []
+        seconds = self.timing is not None
+        for name, fmt, higher_better in self._SCORES:
+            v, b = now[name], base[name]
+            if name == "Scan time":
+                fmt = (lambda x: f"{x:.1f} s") if seconds else (lambda x: f"{x:.0f} %")
+            shown = "\u221e" if math.isinf(v) else fmt(v)   # a perfect match
+            if math.isinf(v) or math.isinf(b):
+                d, colour, dtext = 0.0, "#8a8a8a", "\u2014" if math.isinf(v) != math.isinf(b) else "\u00b10"
+            else:
+                d = v - b
+                tiny = abs(d) < 5e-4*max(1.0, abs(b))
+                better = (d > 0) == higher_better
+                colour = "#8a8a8a" if tiny else ("#4cd07d" if better else "#ff6b6b")
+                pattern = self._DELTA.get(name) or ("{:+.1f} s" if seconds else "{:+.0f} %")
+                dtext = "\u00b10" if tiny else pattern.format(d)
+            cell_now, cell_delta = self.score_cells[name]
+            cell_now.set_text(shown)
+            cell_delta.set_text(dtext); cell_delta.set_color(colour)
+            lines.append(f"{name}  {shown}  {dtext}")
+        self.info_text = "\n".join(lines)
+
+    def _status(self, out: dict) -> str:
+        """Everything that is not a score: time, what is on, where the data came from."""
+        parts = [f"ready ({self.elapsed_ms} ms)",
+                 "{} of {} rows, {} of {} columns measured".format(
+                     *out["sampling"]["rows"], *out["sampling"]["cols"])]
+        edits = self._active_edits().strip()
+        if edits:
+            parts.append(edits)
+        if out["averaged"] > 1:
+            # Say what alignment found, so a failure is explainable: a phase
+            # offset near pi is exactly what cancels a naive average.
+            al = out["alignment"]
+            found = "" if not al["phases"] else (
+                " (phase offsets " + ", ".join(f"{p:+.2f}" for p in al["phases"]) + " rad, shifts "
+                + ", ".join(str(d) for d in al["shifts"]) + ")")
+            parts.append(f"averaged {out['averaged']} scans{found}")
+        parts.append(self.raw_note if self.raw_note else "simulated phantom")
+        if self.ref_note:
+            parts.append(f"ref: {self.ref_note}")
+        return "   |   ".join(parts)
 
     def _active_edits(self) -> str:
         """Names whatever is switched on, so a surprising picture is explainable."""
@@ -391,11 +476,12 @@ class Main(QMainWindow):
         if s["dc_scale"] != 1.0:        on.append(f"DC x{s['dc_scale']:.2f}")
         if s["spike"]:                  on.append(f"spike +{s['spike']}")
         if s["erase"]:                  on.append(f"erased {s['erase']}")
-        if s["low_pass"]:               on.append(f"low pass {s['low_pass']}")
-        if s["high_pass"]:              on.append(f"high pass {s['high_pass']}")
         if s["partial_fourier"] < 1.0:  on.append(f"partial Fourier {s['partial_fourier']:.2f}")
         if s["window"] != "none":       on.append(s["window"])
         if s["noise"]:                  on.append(f"noise {s['noise']:.2f}")
+        if s["noise_filter"]:           on.append(f"noise floor x{s['noise_filter']:.2f}")
+        if s["sharpen"]:                on.append(f"sharpen {s['sharpen']:.2f}")
+        if s["keep"] != "both":         on.append(f"{s['keep']} only")
         if s["upscale"] > 1:            on.append(f"x{s['upscale']} {s['interp']}")
         return "    " + ", ".join(on) if on else ""
 
@@ -464,11 +550,11 @@ if __name__ == "__main__":
             raise AssertionError(win.statusBar().currentMessage())
 
         wait_done()
-        # Full sampling: every line measured, and no quality numbers on screen.
-        msg = win.statusBar().currentMessage()
-        assert "100% of k-space measured" in msg, msg
-        for leaked in ("PSNR", "SSIM", "MSE"):
-            assert leaked not in msg, f"{leaked} must not appear in the GUI: {msg}"
+        # Full sampling: every line measured, and all five scores on the card.
+        assert "256 of 256 rows, 256 of 256 columns measured" in win.status_text, win.status_text
+        for name in ("Acceleration", "Scan time", "Aliasing loss", "SNR", "SSIM", "PSNR"):
+            assert name in win.info_text, win.info_text
+        assert "1.00\u00d7" in win.info_text and "0.0 %" in win.info_text
 
         before = win.artists[3].get_array().copy()   # augmented reconstruction
         win.controls.rate.setValue(50)
@@ -476,28 +562,30 @@ if __name__ == "__main__":
         wait_done()
         assert not (before == win.artists[3].get_array()).all(), "rate slider changed nothing"
 
-        win.controls.sampling.setCurrentText("radial")
-        win.timer.stop(); win._run(); wait_done()
-        assert "trajectory" in win.statusBar().currentMessage()
-
-        win.controls.sampling.setCurrentText("spiral")
-        win.timer.stop(); win._run(); wait_done()
-
-        # compressed sensing still runs, it is just not the default
-        win.controls.sampling.setCurrentText("cartesian")
-        win.controls.mask.setCurrentText("random")
-        win.controls.recon.setCurrentText("compressed sensing")
-        win.timer.stop(); win._run(); wait_done()
-        win.controls.recon.setCurrentText("zero-filled")
-        win.controls.mask.setCurrentText("nyquist")
         win.timer.stop(); win._run(); wait_done()
 
         # four panels, and none of them leaks the hidden reference: neither the
         # reference itself nor the error map derived from it
         assert len(win.artists) == 4, f"expected 4 panels, got {len(win.artists)}"
-        assert win.artists[0] is None, "panel 0 is a profile plot, not an image"
-        xs, ys = win.profile_line.get_data()
-        assert len(xs) > 0 and float(max(ys)) > 0.5, "the profile should have been drawn"
+        assert win.artists[0] is None, "panel 0 is the scorecard, not an image"
+
+        # the card moves with the knob: half the lines is twice as fast, it
+        # aliases, and both show as a change against the base
+        win.controls.rate.setValue(50)
+        win.timer.stop(); win._run(); wait_done()
+        now, delta = win.score_cells["Acceleration"]
+        assert now.get_text() == "2.00\u00d7" and delta.get_text() == "+1.00\u00d7", win.info_text
+        now, delta = win.score_cells["Scan time"]
+        assert now.get_text() == "50 %" and delta.get_color() == "#4cd07d", win.info_text
+        now, delta = win.score_cells["Aliasing loss"]
+        assert float(now.get_text().split()[0]) > 20 and delta.get_color() == "#ff6b6b"
+        now, delta = win.score_cells["SSIM"]
+        assert delta.get_text().startswith("-") and delta.get_color() == "#ff6b6b"
+        win.controls.rate.setValue(100)
+        win.timer.stop(); win._run(); wait_done()
+        assert win.score_cells["Acceleration"][1].get_text() == "\u00b10"
+        win.controls.rate.setValue(50)
+        win.timer.stop(); win._run(); wait_done()
 
         # every k-space edit runs and visibly changes the reconstruction
         untouched = win.artists[2].get_array().copy()   # the base panel
@@ -505,9 +593,9 @@ if __name__ == "__main__":
         for name, widget, value in (("dc", win.controls.dc, 40),
                                     ("spike", win.controls.spike, 20),
                                     ("erase", win.controls.erase, 40),
-                                    ("low pass", win.controls.low_pass, 40),
-                                    ("high pass", win.controls.high_pass, 20),
-                                    ("partial fourier", win.controls.pf, 60)):
+                                    ("partial fourier", win.controls.pf, 60),
+                                    ("add noise", win.controls.noise, 20),
+                                    ("sharpen", win.controls.sharpen, 50)):
             widget.setValue(value)
             win.timer.stop(); win._run(); wait_done()
             assert not (base == win.artists[3].get_array()).all(), f"{name} changed nothing"
@@ -515,6 +603,25 @@ if __name__ == "__main__":
                 f"{name} moved the base panel, which must stay put"
             widget.setValue(100 if widget in (win.controls.dc, win.controls.pf) else 0)
             win.timer.stop(); win._run(); wait_done()
+
+        # phase only keeps the outlines; the dropdown changes the picture
+        win.controls.keep.setCurrentText("phase only")
+        win.timer.stop(); win._run(); wait_done()
+        assert not (base == win.artists[3].get_array()).all(), "phase only changed nothing"
+        assert "phase only" in win.status_text
+        win.controls.keep.setCurrentText("magnitude and phase")
+        win.timer.stop(); win._run(); wait_done()
+
+        # erasing the centre must not brighten the rest of the k-space panel
+        import numpy as np
+        kbefore = np.asarray(win.artists[1].get_array()).copy()
+        win.controls.erase.setValue(40)
+        win.timer.stop(); win._run(); wait_done()
+        kafter = np.asarray(win.artists[1].get_array())
+        assert np.abs(kafter[:40, :40] - kbefore[:40, :40]).max() < 1e-12, \
+            "the k-space display scale moved when the centre was erased"
+        win.controls.erase.setValue(0)
+        win.timer.stop(); win._run(); wait_done()
 
         # upscaling enlarges the output, and the method row appears with it
         c = win.controls
@@ -529,16 +636,12 @@ if __name__ == "__main__":
 
         # rows hide themselves when the mode cannot use them
         vis = lambda n: c._forms[n].isRowVisible(c.rows[n])
-        assert vis("rate") and not vis("spokes")
-        c.sampling.setCurrentText("radial")
-        assert vis("spokes") and not vis("rate")
-        c.sampling.setCurrentText("spiral")
-        assert vis("arms") and not vis("spokes")
+        assert vis("rate") and vis("noise"), "the phantom offers rate and added noise"
+        assert not vis("average"), "one phantom, nothing to average"
         assert not vis("sigma")
         c.window.setCurrentText("gaussian")
         assert vis("sigma"), "sigma must appear for the gaussian window"
         c.window.setCurrentText("none")
-        c.sampling.setCurrentText("cartesian")
         win.timer.stop(); win._run(); wait_done()
 
         # the range dialog retunes how far a slider travels, within the caps
@@ -600,8 +703,45 @@ if __name__ == "__main__":
         c.noise.setValue(0)
         win.timer.stop(); win._run(); wait_done()
 
-        print("SELFTEST PASSED - 4 panels, no leaked metrics, k-space edits, "
-              "base panel, slider ranges and window/level wired")
+        # real data with repetitions: averaging appears, runs, and says what it found
+        from mri.raw_data import find_repetitions
+        multi = [f for f in win.datasets if len(find_repetitions(str(f))) > 1]
+        if multi:
+            c.rate.setValue(100)
+            c.source.setCurrentText(multi[0].name); wait_done()
+            assert vis("average") and not vis("noise"), "real scans average, never add noise"
+            single = win.artists[3].get_array().copy()
+            c.average.setCurrentIndex(c.average.count() - 1)
+            win.timer.stop(); win._run(); wait_done()
+            msg = win.status_text
+            assert f"averaged {c.average.count()} scans" in msg and "phase offsets" in msg, msg
+            # a real scan: TR x ceil(lines / train) per scan, from the file itself
+            import math
+            n = c.average.count()
+            tr, train = win.timing
+            k1 = load_raw_kspace(win.raw_path, c.slice_idx.value())
+            lines = int((np.abs(k1).sum(axis=(0, 1)) > 0).sum())   # phase-encode columns
+            one = tr*math.ceil(lines/train)
+            assert win.score_cells["Scan time"][0].get_text() == f"{one*n:.1f} s", (one, win.info_text)
+            assert win.score_cells["Acceleration"][0].get_text() == f"{1/n:.2f}\u00d7"
+            c.pf.setValue(60)
+            win.timer.stop(); win._run(); wait_done()
+            assert float(win.score_cells["Acceleration"][0].get_text()[:-1]) > 1/n, \
+                "partial Fourier must raise the acceleration"
+            c.pf.setValue(100)
+            # averaging is a real denoiser: the card must say SNR went up
+            now, delta = win.score_cells["SNR"]
+            assert delta.get_color() == "#4cd07d", (now.get_text(), delta.get_text())
+            assert not (single == win.artists[3].get_array()).all()
+            assert (win.base == win.artists[2].get_array()).all(), "the base stays one scan"
+            c.average.setCurrentIndex(0)
+            c.source.setCurrentIndex(0); wait_done()
+            print(f"  averaging checked on {multi[0].name}")
+        else:
+            print("  no repeated scans on disk, averaging check skipped")
+
+        print("SELFTEST PASSED - 4 panels, scorecard, k-space edits, denoising, "
+              "fixed k-space scale, base panel, slider ranges and window/level wired")
         QTimer.singleShot(0, app.quit)
 
     sys.exit(app.exec())
