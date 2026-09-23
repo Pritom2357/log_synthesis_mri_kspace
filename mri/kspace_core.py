@@ -107,12 +107,17 @@ def radius_grid(shape:tuple[int,int])->np.ndarray:
     return np.hypot(Y-rows//2, X-cols//2)
 
 def low_pass(k:np.ndarray,radius:float)->np.ndarray:
-    """Keeps the central disc of k-space, zeroing everything outside it."""
-    return np.where(radius_grid(k.shape) <= radius, k, 0.0)
+    """
+    Keeps the central disc of k-space, zeroing everything outside it.
+
+    The radius grid is built on the last two axes, so multi-coil k-space of
+    shape (coils, ky, kx) broadcasts and every channel is filtered the same.
+    """
+    return np.where(radius_grid(k.shape[-2:]) <= radius, k, 0.0)
 
 def high_pass(k:np.ndarray,radius:float)->np.ndarray:
-    """Deletes the central disc and keeps the periphery."""
-    return np.where(radius_grid(k.shape) > radius, k, 0.0)
+    """Deletes the central disc and keeps the periphery. Coil-safe, as above."""
+    return np.where(radius_grid(k.shape[-2:]) > radius, k, 0.0)
 
 # -------------------------------
 # Tests for kspace_core.py only
