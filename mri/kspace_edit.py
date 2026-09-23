@@ -19,8 +19,9 @@ Each function here is a one-line demonstration of a property from the course:
 from __future__ import annotations
 import numpy as np
 
-__all__ = ["dc_index","scale_dc","add_spike","erase_patch","partial_fourier",
-           "hermitian_fill"] # Only these will be exported
+__all__ = ["dc_index","phase_axis","measured_lines",
+           "scale_dc","add_spike","erase_patch","partial_fourier",
+           "hermitian_fill","keep_part"] # Only these will be exported
 
 # ------
 # Helper
@@ -51,6 +52,27 @@ def dc_index(k:np.ndarray)->tuple[int,int]:
     """
     mag = np.abs(k) if k.ndim == 2 else np.abs(k).sum(axis=0)
     return tuple(int(v) for v in np.unravel_index(mag.argmax(),mag.shape))
+
+def phase_axis(k:np.ndarray)->int:
+    """
+    Which array axis holds the phase-encode lines: -2 (rows) or -1 (columns).
+
+    Only phase-encode lines cost scan time, one echo each; a readout line is
+    recorded in one go, so its samples are free. Scanners that measure fewer
+    phase-encode lines than the matrix has leave the rest as whole zero lines,
+    which gives the axis away: on the M4Raw files 60 of 256 COLUMNS are empty,
+    so there the columns are the phase-encode lines. With no empty lines at all
+    (a simulated phantom) rows are assumed.
+    """
+    mag = np.abs(k) if k.ndim == 2 else np.abs(k).sum(axis=0)
+    empty_rows = int((mag.sum(axis=1) == 0).sum())
+    empty_cols = int((mag.sum(axis=0) == 0).sum())
+    return -1 if empty_cols > empty_rows else -2
+
+def measured_lines(k:np.ndarray,axis:int)->np.ndarray:
+    """Boolean per phase-encode line: True where anything was recorded."""
+    mag = np.abs(k) if k.ndim == 2 else np.abs(k).sum(axis=0)
+    return mag.sum(axis=-1 if axis == -2 else 0) > 0
 
 def scale_dc(k:np.ndarray,scale:float)->np.ndarray:
     """
@@ -119,6 +141,27 @@ def erase_patch(k:np.ndarray,dy:int,dx:int,size:int)->np.ndarray:
 
     out[...,y0:y1,x0:x1] = 0
     return out
+
+def keep_part(k:np.ndarray,part:str)->np.ndarray:
+    """
+    Throws away either the magnitude or the phase of every k-space sample.
+
+    part: 'both' | 'magnitude' | 'phase'
+        magnitude - every sample keeps its size, loses its angle. The image
+                    loses its structure: where each wave sits is gone.
+        phase     - every sample keeps its angle, its size set to the mean
+                    size. The outlines survive, because the phase is what says
+                    where each edge is. This is the magnitude/phase swap from
+                    the course, done inside one scan.
+    """
+    kind = part.strip().lower()
+    if kind == "both":
+        return k
+    if kind == "magnitude":
+        return np.abs(k).astype(np.complex128)
+    if kind == "phase":
+        return np.exp(1j*np.angle(k))*float(np.abs(k).mean())
+    raise ValueError(f"Unknown part: {part!r}. Expected: both, magnitude, phase.")
 
 def hermitian_fill(k:np.ndarray,measured:np.ndarray)->np.ndarray:
     """
@@ -279,8 +322,28 @@ if __name__ == "__main__":
         "fraction 1.0 keeps everything and must be lossless"
     print("[partial 1.00] keeping every line is lossless, as expected")
 
+    # --- Line layout: which axis costs time, which lines were measured ---
+    assert phase_axis(k) == -2, "no empty lines: rows are assumed"
+    padded = np.array(k,copy=True); padded[:,:30] = 0; padded[:,-30:] = 0
+    assert phase_axis(padded) == -1, "empty columns mark the columns as phase-encode"
+    assert phase_axis(np.stack([padded,padded])) == -1, "coil axis must not matter"
+    assert measured_lines(padded,-1).sum() == shape[1]-60
+    assert measured_lines(padded,-2).all(), "every row still has data"
+    print("[layout]      phase-encode axis found from empty lines; measured lines counted")
+
+    # --- Phase carries the structure, magnitude does not ---
+    assert keep_part(k,"both") is k
+    phase_only = nrm(from_kspace(keep_part(k,"phase")))
+    mag_only = nrm(from_kspace(keep_part(k,"magnitude")))
+    edges = lambda a: np.corrcoef(np.hypot(*np.gradient(a)).ravel(),
+                                  np.hypot(*np.gradient(img)).ravel())[0,1]
+    assert edges(phase_only) > edges(mag_only)+0.2, (edges(phase_only),edges(mag_only))
+    print(f"[mag/phase]   edge match with the original: phase only {edges(phase_only):.2f}"
+          f", magnitude only {edges(mag_only):.2f}")
+
     # --- Guards ---
-    for bad in (lambda: scale_dc(k,-1.0),
+    for bad in (lambda: keep_part(k,"neither"),
+                lambda: scale_dc(k,-1.0),
                 lambda: add_spike(k,9999,0),
                 lambda: erase_patch(k,0,0,0),
                 lambda: partial_fourier(k,0.2)):

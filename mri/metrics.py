@@ -5,7 +5,7 @@ original, plus the error map the GUI shows as a heatmap.
 from __future__ import annotations
 import numpy as np
 
-__all__ = ["mse","psnr","ssim","error_map","compute_metrics"] # Only these will be exported
+__all__ = ["mse","psnr","ssim","snr","error_map","compute_metrics"] # Only these will be exported
 
 # ------
 # Helper
@@ -48,6 +48,30 @@ def ssim(original:np.ndarray,recon:np.ndarray,data_range:float=1.0)->float:
     from skimage.metrics import structural_similarity
     x,y = _as_pair(original,recon)
     return float(structural_similarity(x,y,data_range=data_range))
+
+def snr(img:np.ndarray,corner:int=32)->float:
+    """
+    Signal-to-noise ratio of one magnitude image, with no reference needed.
+
+    Noise is read from the four corners, which hold no anatomy. A magnitude
+    image turns pure complex noise of spread sigma into a Rayleigh distribution
+    whose own spread is only 0.655*sigma, so the corner spread is divided by
+    0.655 to get sigma back. Signal is the mean of the pixels clearly brighter
+    than the corners. Ghosts that fold into the corners count as noise, which
+    is fair: in the background they are just as unwanted.
+
+    Return: mean tissue / sigma, or infinity when the corners are exactly flat.
+    """
+    a = np.asarray(img,dtype=np.float64)
+    c = corner
+    bg = np.concatenate([a[:c,:c].ravel(),a[:c,-c:].ravel(),a[-c:,:c].ravel(),a[-c:,-c:].ravel()])
+    sd = float(bg.std())
+    tissue = a[a > bg.mean()+3*sd]
+    if sd == 0.0:
+        return float("inf")
+    if tissue.size == 0:
+        return 0.0
+    return float(tissue.mean()/(sd/0.655))
 
 def error_map(original:np.ndarray,recon:np.ndarray)->np.ndarray:
     """Absolute difference per pixel, for display as a heatmap."""
@@ -107,6 +131,23 @@ if __name__ == "__main__":
     assert emap.shape == img.shape and emap.min() >= 0.0
     assert emap.max() > 0.0, "an undersampled reconstruction cannot be perfect"
     print(f"[error map]   max={emap.max():.4f}  mean={emap.mean():.4f}")
+
+    # --- SNR recovers a known noise level, and falls as noise rises ---
+    rng = np.random.default_rng(0)
+    last = float("inf")
+    for sigma in (0.02,0.05,0.1):
+        noisy = np.abs(img + sigma*(rng.normal(size=img.shape)+1j*rng.normal(size=img.shape)))
+        est = snr(noisy)
+        # same tissue pixels the estimator picks, divided by the TRUE sigma:
+        # this isolates the noise estimate, which is the part that can be wrong
+        bg = np.concatenate([noisy[:32,:32].ravel(),noisy[:32,-32:].ravel(),
+                             noisy[-32:,:32].ravel(),noisy[-32:,-32:].ravel()])
+        truth = noisy[noisy > bg.mean()+3*bg.std()].mean()/sigma
+        assert abs(est/truth-1) < 0.15, (sigma,est,truth)
+        assert est < last, "more noise must mean lower SNR"
+        last = est
+        print(f"[snr]         sigma={sigma:.2f}  measured={est:6.1f}  true={truth:6.1f}")
+    assert np.isinf(snr(img)), "a noise-free phantom has flat corners"
 
     # --- Shape mismatches are rejected rather than broadcast ---
     try:

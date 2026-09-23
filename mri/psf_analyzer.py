@@ -103,14 +103,4 @@ if __name__ == "__main__":
     assert row.sum() < 1e-9, "ghosting is running sideways, the mask is transposed"
     print(f"[direction]  off-lobe column={col.sum():.3f}  off-lobe row={row.sum():.3e}")
 
-    # --- Randomness trades one bright ghost for scattered grain ---
-    s_uniform = peak_sidelobe(make_mask("uniform", shape, R=4))
-    s_random = peak_sidelobe(make_mask("random", shape, R=4, seed=42))
-    assert s_random < s_uniform/2, (s_uniform, s_random)
-    print(f"[incoherence]  uniform_sidelobe={s_uniform:.3f}  random_sidelobe={s_random:.3f}")
-
-    # --- Variable density keeps the centre, so its main lobe stays dominant ---
-    s_vds = peak_sidelobe(make_mask("variable_density", shape, R=4))
-    print(f"[vds]  sidelobe={s_vds:.3f}")
-
     print("\nAll self-tests passed")

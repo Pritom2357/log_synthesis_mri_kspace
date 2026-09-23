@@ -90,6 +90,18 @@ def _matrix(xml:str,block:str)->tuple[int,int,int]:
     inner = b.group(1)
     return tuple(int(float(_tag(inner,ax,"0") or 0)) for ax in ("x","y","z"))
 
+def _timing(xml:str)->dict:
+    """
+    Repetition time (ms) and echo-train length, the two numbers that turn a
+    count of phase-encode lines into seconds: a fast spin echo acquires one
+    echo train of lines per TR, so a scan takes TR x ceil(lines / train).
+    NaN and 1 when the header does not say.
+    """
+    tr = _tag(xml,"TR","")
+    etl = _tag(xml,"echo_train_length","")
+    return {"TR_ms": float(tr) if tr else float("nan"),
+            "echo_train_length": int(float(etl)) if etl else 1}
+
 def _complex_readout(row:np.ndarray,n_samples:int,n_coils:int)->np.ndarray:
     """
     One readout, unpacked into (coils, samples).
@@ -132,6 +144,7 @@ def _info_fastmri(path:str)->dict:
         "is_3d": False,                    # fastMRI files are 2D multi-slice
         "n_slices": int(n_sl),
         "n_encode_2": 1,
+        **_timing(xml),
     }
 
 def _to_our_convention(k:np.ndarray)->np.ndarray:
@@ -273,6 +286,7 @@ def raw_info(path:str)->dict:
         n_acquisitions   - how many readouts are in the file
         is_3d            - True when the second phase-encode axis is sampled
         n_slices         - separately excited slices (1 for a 3D volume)
+        TR_ms, echo_train_length - scan timing, see _timing
     """
     import h5py
 
@@ -306,6 +320,7 @@ def raw_info(path:str)->dict:
         "is_3d": len(e2) > 1,
         "n_slices": int(len(slices)),
         "n_encode_2": int(len(e2)),
+        **_timing(xml),
     }
 
 def load_raw_kspace(path:str,slice_index:int|None=None)->np.ndarray:
@@ -471,8 +486,8 @@ if __name__ == "__main__":
 
     # --- And it drops straight into the existing pipeline ---
     from mri.pipeline import reconstruct
-    out = reconstruct(img,{"mask":"random","R":4,"seed":0,"recon":"cs"})
-    print(f"[pipeline]   real scan through the pipeline, random R=4: "
+    out = reconstruct(img,{"rate":0.5})
+    print(f"[pipeline]   real scan through the pipeline, half the Nyquist rate: "
           f"psnr={out['metrics']['psnr']:.2f} ssim={out['metrics']['ssim']:.3f}")
 
     # --- Reconstructing FROM the measured k-space, with no forward transform ---
@@ -481,14 +496,14 @@ if __name__ == "__main__":
     from mri.pipeline import reconstruct as _recon
     _ref = load_vendor_reconstruction(path)
     if _ref is not None:
-        full = _recon(None,{"R":1},kspace=load_raw_kspace(path),reference=_ref)
+        full = _recon(None,{},kspace=load_raw_kspace(path),reference=_ref)
         assert full["metrics"]["ssim"] > 0.99, full["metrics"]
         print(f"[from kspace] fully sampled real data -> psnr={full['metrics']['psnr']:.1f} "
               f"ssim={full['metrics']['ssim']:.4f}  (no forward transform used)")
 
         prev = full["metrics"]["ssim"]
         for rate in (0.9,0.7,0.5):
-            part = _recon(None,{"mask":"nyquist","rate":rate},
+            part = _recon(None,{"rate":rate},
                           kspace=load_raw_kspace(path),reference=_ref)
             ssim = part["metrics"]["ssim"]
             assert ssim < prev, f"rate {rate} did not cost quality"
