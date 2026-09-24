@@ -63,6 +63,10 @@ def add_noise(k:np.ndarray, sigma:float, seed:int|None=None)->np.ndarray:
     Adds complex Gaussian noise. sigma is a fraction of the mean k-space
     magnitude, so the same slider value means the same visible grain on any
     image. sigma=0 returns k untouched.
+
+    The mean is taken over measured (non-zero) samples only. Averaging in the
+    rows that undersampling zeroed out used to make the noise weaker the fewer
+    rows were kept -- half the rows, half the noise.
     """
     if sigma < 0:
         raise ValueError("sigma must be non-negative")
@@ -70,6 +74,8 @@ def add_noise(k:np.ndarray, sigma:float, seed:int|None=None)->np.ndarray:
         return k
 
     rng = np.random.default_rng(seed)
-    scale = sigma * float(np.abs(k).mean())
+    mag = np.abs(k)
+    measured = mag[mag > 0]
+    scale = sigma * float(measured.mean() if measured.size else 0.0)
     noise = rng.normal(0.0, scale, k.shape) + 1j*rng.normal(0.0, scale, k.shape)
     return k+noise

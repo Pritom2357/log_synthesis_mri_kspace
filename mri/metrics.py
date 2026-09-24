@@ -67,7 +67,7 @@ def snr(img:np.ndarray,corner:int=32)->float:
     bg = np.concatenate([a[:c,:c].ravel(),a[:c,-c:].ravel(),a[-c:,:c].ravel(),a[-c:,-c:].ravel()])
     sd = float(bg.std())
     tissue = a[a > bg.mean()+3*sd]
-    if sd == 0.0:
+    if sd <= 1e-9*max(float(np.abs(a).max()),1e-300): # flat up to FFT rounding
         return float("inf")
     if tissue.size == 0:
         return 0.0
