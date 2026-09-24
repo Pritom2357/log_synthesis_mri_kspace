@@ -49,7 +49,7 @@ DEFAULTS = {
     "average": 1,              # how many repetitions to average (1 = this scan)
     "align": True,             # undo shift and phase drift before averaging
     "window": "none",          # none | hamming | gaussian
-    "sigma": 0.35,             # gaussian window width, normalised radius
+    "sigma": 0.8,              # gaussian window width, normalised radius (0.8 measured best)
     "noise_filter": 0.0,       # noise-floor filter strength (0 = off)
     "sharpen": 0.0,            # unsharp-mask amount (0 = off)
 
@@ -262,7 +262,21 @@ def reconstruct(img:np.ndarray|None,settings:dict|None=None,
         ks = (np.stack([zero_fill_to(crop_kspace(c,s["crop"]),target) for c in ks]) if multicoil
               else zero_fill_to(crop_kspace(ks,s["crop"]),target))
 
-    recon = _normalise(sharpen(_normalise(_to_image(ks)),float(s["sharpen"])))
+    # --- sinc upscaling = zero-filling, done per coil before combining ---
+    # Padding k-space with zeros and transforming back is ideal (sinc)
+    # interpolation. Scanners do it on each coil's raw k-space, before the
+    # coils are combined; padding the finished magnitude image instead would
+    # interpolate a picture whose phase has already been thrown away.
+    zero_fill = int(s["upscale"]) if s["upscale"] > 1 and s["interp"] == "sinc" else 1
+    if zero_fill > 1:
+        big = (ks.shape[-2]*zero_fill,ks.shape[-1]*zero_fill)
+        ks_out = np.stack([zero_fill_to(c,big) for c in ks]) if multicoil else zero_fill_to(ks,big)
+    else:
+        ks_out = ks
+    # The sharpening blur is 1 pixel of the scan; zero-filling made pixels
+    # smaller, so the blur widens with it and the setting keeps its meaning.
+    recon = _normalise(sharpen(_normalise(_to_image(ks_out)),float(s["sharpen"]),
+                               sigma=float(zero_fill)))
     reference = _normalise(np.asarray(reference,dtype=np.float64))
 
     # --- restrict the edits to one region ---
@@ -277,10 +291,12 @@ def reconstruct(img:np.ndarray|None,settings:dict|None=None,
         recon = _normalise(blend(plain,recon,s["roi"],s["feather"]))
 
     # --- resolution, last: enlarge the finished picture ---
-    # The reference is enlarged the same way so the two stay comparable, which
-    # means the metrics measure the interpolation and nothing else.
+    # Sinc was already done above, in k-space. Linear and zero-order hold are
+    # image-domain methods by definition, so they work on the finished picture.
+    # The reference is enlarged by sinc so the two stay comparable.
     if s["upscale"] > 1:
-        recon = _normalise(resize(recon,int(s["upscale"]),s["interp"]))
+        if zero_fill == 1:
+            recon = _normalise(resize(recon,int(s["upscale"]),s["interp"]))
         reference = _normalise(resize(reference,int(s["upscale"]),"sinc"))
     return {
         "kspace": _display_kspace(ks,top),
@@ -359,6 +375,17 @@ if __name__ == "__main__":
               f"  aliasing {100*fact['alias_energy']:5.2f}%  psnr={m['psnr']:6.2f}")
     assert reconstruct(img)["sampling"]["alias_energy"] == 0.0
 
+    # --- Added noise has the same strength whatever the sampling rate ---
+    from mri.filters import add_noise
+    k_full = to_kspace(img)
+    for rate in (1.0,0.5):
+        m = make_mask("nyquist",img.shape,1,rate=rate).astype(bool)
+        grain = (add_noise(k_full*m,0.2,0)-k_full*m)[m]
+        if rate == 1.0:
+            full_grain = np.abs(grain).std()
+    assert abs(np.abs(grain).std()/full_grain-1) < 0.05, "noise must not shrink with the rate"
+    print("[noise]      added noise per measured sample is the same at rate 1.0 and 0.5")
+
     # --- Noise is added before the filters, so they can remove it ---
     noisy = reconstruct(img,{"noise":0.5,"seed":3})["metrics"]["psnr"]
     for name,extra in (("noise floor",{"noise_filter":1.0}),
@@ -411,6 +438,19 @@ if __name__ == "__main__":
     # --- Undersampling skips rows ---
     under = reconstruct(None,{"rate":0.5},kspace=padded,reference=img)
     assert under["mask"][0,:].all() and not under["mask"][:,0].all(), "rows are skipped"
+
+    # --- Sinc upscaling zero-fills each coil's k-space before combining ---
+    coils = np.stack([k0*np.exp(1.0j),0.5*k0*np.exp(-2.0j)])     # two coils, different phases
+    up = reconstruct(None,{"upscale":2,"interp":"sinc"},kspace=coils,reference=img)
+    assert up["recon"].shape == (512,512) and up["kspace"].shape == img.shape
+    per_coil = np.fft.ifft2(np.fft.ifftshift(np.stack([zero_fill_to(c,(512,512)) for c in coils]),
+                                             axes=(-2,-1)),axes=(-2,-1))
+    manual = _normalise(np.sqrt((np.abs(per_coil)**2).sum(axis=0)))
+    assert np.abs(up["recon"]-manual).max() < 1e-12, "must be RSS of zero-filled coils"
+    for it in ("linear","zero_order_hold"):
+        assert reconstruct(img,{"upscale":2,"interp":it})["recon"].shape == (512,512)
+    print(f"[zero-fill]  sinc x2: each coil padded to 512 in k-space, then combined;"
+          f" ssim vs sinc-enlarged reference {up['metrics']['ssim']:.3f}")
 
     # --- Reduced FOV shrinks the output and compares against the intended crop ---
     for f in (2,4):

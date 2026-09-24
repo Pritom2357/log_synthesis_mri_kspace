@@ -15,7 +15,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QWidget, QFormLayout, QComboBox, QSlider,
                                QLabel, QCheckBox, QPushButton, QHBoxLayout,
-                               QToolButton, QVBoxLayout, QToolBox, QDialog,
+                               QToolButton, QVBoxLayout, QGroupBox, QDialog,
                                QSpinBox, QDialogButtonBox)
 
 # The dropdowns say it in full; the pipeline wants the short key.
@@ -127,10 +127,10 @@ class Controls(QWidget):
         self.average = QComboBox(); self.average.addItem("1  (this scan only)")
         # Alignment is always on: without it, averaging can cancel the anatomy
         # instead of the noise (see mri/denoise.py).
-        self.nfloor, self.nfloor_lbl = self._slider(0, 300, 0)    # /100 -> strength
+        self.nfloor, self.nfloor_lbl = self._slider(0, 100, 0)    # /100 -> strength; best near 0.5, above 1 only blurs
         self.sharpen, self.sharpen_lbl = self._slider(0, 100, 0)  # /100 -> amount
         self.window = QComboBox(); self.window.addItems(["none", "hamming", "gaussian"])
-        self.sigma, self.sigma_lbl = self._slider(5, 100, 35)     # /100
+        self.sigma, self.sigma_lbl = self._slider(5, 100, 80)     # /100; 0.8 measured best, 0.35 was worse than no window
         self.noise, self.noise_lbl = self._slider(0, 30, 0)       # /100
 
         self.dc, self.dc_lbl = self._slider(0, 200, 100)          # /100 -> DC multiplier
@@ -164,50 +164,59 @@ class Controls(QWidget):
         self.default_ranges = {n: (s.minimum(), s.maximum())
                                for n, s in self.sliders.items()}
 
-        # ---------------- pages ----------------
-        box = QToolBox()
-        box.addItem(self._page([
+        # ---------------- sections, all open ----------------
+        # Plain titled sections instead of an accordion: each section has only
+        # a few rows, so hiding them behind a click cost more than it saved.
+        sections = []
+        sections.append((self._page([
             ("source", "dataset", self.source),
             ("slice_idx", "slice", self._slider_row(self.slice_idx, self.slice_lbl)),
             ("load_row", None, self._row(self.load_btn, self.phantom_btn)),
-        ]), "1 · Data source")
+        ]), "1 · Data source"))
 
-        box.addItem(self._page([
+        sections.append((self._page([
             ("rate", "sampling rate  (x Nyquist rate)", self._slider_row(self.rate, self.rate_lbl)),
-        ]), "2 · Sampling")
+        ]), "2 · Sampling"))
 
-        box.addItem(self._page([
+        sections.append((self._page([
             ("average", "repetitions averaged", self.average),
             ("nfloor", "noise-floor filter", self._slider_row(self.nfloor, self.nfloor_lbl)),
             ("window", "apodization", self.window),
             ("sigma", "window sigma", self._slider_row(self.sigma, self.sigma_lbl)),
             ("sharpen", "sharpen (unsharp mask)", self._slider_row(self.sharpen, self.sharpen_lbl)),
+            ("pf", "partial Fourier", self._slider_row(self.pf, self.pf_lbl)),
+            ("pf_fill", None, self.pf_fill),
             ("noise", "add noise", self._slider_row(self.noise, self.noise_lbl)),
-        ]), "3 · Denoising")
+        ]), "3 · Denoising"))
 
-        box.addItem(self._page([
+        sections.append((self._page([
             ("dc", "DC term", self._slider_row(self.dc, self.dc_lbl)),
             ("spike", "spike offset", self._slider_row(self.spike, self.spike_lbl)),
             ("erase", "erase centre", self._slider_row(self.erase, self.erase_lbl)),
-            ("pf", "partial Fourier", self._slider_row(self.pf, self.pf_lbl)),
-            ("pf_fill", None, self.pf_fill),
             ("keep", "k-space keeps", self.keep),
-        ]), "4 · k-space edits")
+        ]), "4 · k-space edits"))
 
-        box.addItem(self._page([
+        sections.append((self._page([
             ("upscale", "upscale by", self.upscale),
             ("interp", "interpolation", self.interp),
-        ]), "5 · Resolution")
+        ]), "5 · Resolution"))
 
-        box.addItem(self._page([
+        sections.append((self._page([
             ("wl_centre", "level (centre)", self._slider_row(self.wl_centre, self.wl_centre_lbl)),
             ("wl_width", "window (width)", self._slider_row(self.wl_width, self.wl_width_lbl)),
             ("wl_buttons", None, self._row(self.wl_auto, self.wl_reset)),
-        ]), "6 · Display  (window / level)")
+        ]), "6 · Display  (window / level)"))
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(box)
+        outer.setContentsMargins(4, 4, 4, 4)
+        for page, title in sections:
+            group = QGroupBox(title)
+            group.setStyleSheet("QGroupBox { font-weight: bold; }")
+            lay = QVBoxLayout(group)
+            lay.setContentsMargins(0, 4, 0, 0)
+            lay.addWidget(page)
+            outer.addWidget(group)
+        outer.addStretch(1)
 
         # ---------------- wiring ----------------
         for combo in (self.source, self.average, self.window, self.keep,
@@ -235,7 +244,7 @@ class Controls(QWidget):
         """One accordion page: a form built from (name, label, widget) rows."""
         page = QWidget()
         form = QFormLayout(page)
-        form.setContentsMargins(8, 10, 8, 10)
+        form.setContentsMargins(8, 4, 8, 6)
         for name, label, field in entries:
             if label is None:
                 form.addRow(field)

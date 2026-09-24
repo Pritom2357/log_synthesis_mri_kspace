@@ -167,7 +167,12 @@ def noise_floor_filter(k:np.ndarray,strength:float=1.0)->np.ndarray:
         return k
     p = (np.abs(_coils(k))**2).sum(axis=0)
     ring = radius_grid(p.shape,dc_index(k)).astype(int)
-    mean_p = np.bincount(ring.ravel(),p.ravel())/np.maximum(np.bincount(ring.ravel()),1)
+    # Ring power is averaged over measured samples only. Counting the zeros
+    # that undersampling or partial Fourier left behind would halve a ring's
+    # power at half sampling and silently double the filter's strength.
+    measured = (p > 0).ravel()
+    mean_p = (np.bincount(ring.ravel(),p.ravel())
+              /np.maximum(np.bincount(ring.ravel(),measured.astype(float)),1))
     gain = np.clip((mean_p-strength*N)/np.maximum(mean_p,1e-300),0.0,1.0)
     return k*gain[ring]
 
@@ -242,6 +247,12 @@ if __name__ == "__main__":
     # --- The noise-floor filter removes noise; nothing to measure, nothing done ---
     before,after = psnr(n),psnr(noise_floor_filter(n,1.0))
     assert after > before+1.0, (before,after) # measured +1.36 dB
+    # Zeroed rows must not count as "no signal": at half sampling the filter
+    # has to keep the same share of what WAS measured.
+    half_rows = np.zeros(k.shape); half_rows[::2] = 1
+    keep = lambda kk: np.abs(noise_floor_filter(kk,1.0)).sum()/np.abs(kk).sum()
+    assert abs(keep(n*half_rows)-keep(n)) < 0.05, (keep(n),keep(n*half_rows))
+    print(f"[floor]       same strength at half sampling: keeps {keep(n):.3f} vs {keep(n*half_rows):.3f}")
     silent = np.zeros_like(k)
     assert noise_floor_filter(silent,1.0) is silent, "no floor, nothing to remove"
     assert noise_floor_filter(n,0.0) is n

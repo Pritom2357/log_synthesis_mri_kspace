@@ -51,8 +51,9 @@ class Worker(QThread):
     done = Signal(dict)
 
     def __init__(self, img, settings, kspace=None, reference=None, base_key=None,
-                 repeats=None):
+                 repeats=None, gen=0):
         super().__init__()
+        self.gen = gen             # which run this is; stale results are dropped
         self.img, self.settings = img, settings
         self.kspace, self.reference, self.repeats = kspace, reference, repeats
         self.base_key = base_key   # not None means "also build the base image"
@@ -74,9 +75,10 @@ class Worker(QThread):
                 out["base_scores"] = (base["metrics"], base["sampling"])
                 out["base_key"] = self.base_key
             out["_ms"] = int((time.perf_counter() - t0) * 1000)
+            out["_gen"] = self.gen
             self.done.emit(out)
         except Exception as e:  # surface, never crash the GUI thread
-            self.done.emit({"exception": str(e)})
+            self.done.emit({"exception": str(e), "_gen": self.gen})
 
 
 class Main(QMainWindow):
@@ -86,10 +88,10 @@ class Main(QMainWindow):
         self.image = load_phantom()
         self.worker = None
         self.pending = None  # latest settings that arrived while busy
+        self._gen = 0          # number of the newest run started
         self.elapsed_ms = 0
         self.raw_path = None   # set when a real scan is selected
         self.raw_note = ""     # scanner description for the status bar
-        self.timing = None     # (TR in s, echo-train length) of a real scan
         self.ref_note = ""     # where the comparison image came from
         self.base = None       # this slice with nothing switched on
         self.base_scores = None  # (metrics, sampling) of the base, for the deltas
@@ -116,21 +118,27 @@ class Main(QMainWindow):
         self.canvas = FigureCanvasQTAgg(fig)
         # Panel 0 is the scorecard: five numbers, each next to how it moved
         # against the base, so every knob can be judged the moment it moves.
-        grid = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.6])
+        # Top row: scorecard | k-space | scan details. Bottom row: base | yours.
+        # Six columns so three top cells and two bottom cells share one grid.
+        grid = fig.add_gridspec(2, 6, height_ratios=[1.35, 1.6])
         self.axes, self.artists = [], []
-        ax0 = fig.add_subplot(grid[0, 0])
+        ax0 = fig.add_subplot(grid[0, 0:2])
         self._build_scorecard(ax0)
         self.axes.append(ax0)
         self.artists.append(None)   # panel 0 is a table, not an image
 
-        for t, cm, cell in (("measured k-space", "magma", grid[0, 1]),
-                            ("base  (nothing switched on)", "gray", grid[1, 0]),
-                            ("my reconstruction", "gray", grid[1, 1])):
+        for t, cm, cell in (("measured k-space", "magma", grid[0, 2:4]),
+                            ("base  (nothing switched on)", "gray", grid[1, 0:3]),
+                            ("my reconstruction", "gray", grid[1, 3:6])):
             ax = fig.add_subplot(cell)
             ax.set_title(t, color="white", fontsize=9)
             ax.axis("off")
             self.axes.append(ax)
             self.artists.append(ax.imshow(self.image, cmap=cm, vmin=0, vmax=1))
+
+        # The scan details sit right of the k-space. They replace the status
+        # bar, which ran off the bottom of the window where nobody read it.
+        self._build_details(fig.add_subplot(grid[0, 4:6]))
 
         self.controls = Controls()
         self._fill_sources()
@@ -229,7 +237,6 @@ class Main(QMainWindow):
         if name == PHANTOM:
             self.raw_path, self.raw_note, self.ref_note = None, "", ""
             self.image = load_phantom()
-            self.timing = None
             self.controls.set_repetitions(1)
         else:
             match = [f for f in self.datasets if f.name == name]
@@ -238,9 +245,6 @@ class Main(QMainWindow):
             self.raw_path = str(match[0])
             try:
                 info = raw_info(self.raw_path)
-                tr = info.get("TR_ms", float("nan"))
-                self.timing = ((tr/1000.0, max(1, info.get("echo_train_length", 1)))
-                               if tr == tr and tr > 0 else None)   # tr == tr: not NaN
                 n_reps = len(find_repetitions(self.raw_path))
                 self.controls.set_repetitions(n_reps)
                 self.raw_note = describe(self.raw_path) + (
@@ -261,7 +265,7 @@ class Main(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.pending = self.controls.settings()  # remember, rerun on finish
             return
-        self.statusBar().showMessage("reconstructing...")
+        self._set_state("reconstructing...")
         settings = self.controls.settings()
         # The base only depends on which slice of which file we are looking at,
         # so it is rebuilt when that changes and reused every other time.
@@ -284,7 +288,7 @@ class Main(QMainWindow):
                 # no longer perfect and there is something to improve.
                 ref, self.ref_note = reference_image(self.raw_path, z)
             except Exception as e:
-                self.statusBar().showMessage(f"error reading slice {z}: {e}")
+                self._set_state(f"error reading slice {z}: {e}")
                 return
             # Other scans of the same slice, loaded only when averaging asks
             # for them: this scan first, then its siblings in file order.
@@ -296,33 +300,57 @@ class Main(QMainWindow):
                     repeats = [load_raw_kspace(p, z)
                                for p in others[:settings["average"] - 1]]
                 except Exception as e:
-                    self.statusBar().showMessage(f"error reading a repetition: {e}")
+                    self._set_state(f"error reading a repetition: {e}")
                     return
             self.worker = Worker(None, settings, kspace=k, reference=ref,
                                  base_key=base_key, repeats=repeats)
 
+        self._gen += 1
+        self.worker.gen = self._gen
         self.worker.done.connect(self._show)
+        self.worker.finished.connect(self._next)
         self.worker.start()
+
+    def _next(self):
+        """
+        A setting changed while this reconstruction was running, so the picture
+        on screen is already out of date: run once more with the latest values.
+
+        This hangs off QThread.finished, not off the result arriving. The
+        result is emitted from inside run(), so at that moment the thread is
+        still alive; restarting from there found it "busy", re-queued the
+        settings, and nothing ever started them -- the last slider move was
+        silently dropped and the picture disagreed with the controls.
+        """
+        if self.pending is not None:
+            self.pending = None
+            self._run()
 
     def _show(self, out: dict):
         """
         Paint one result. Wrapped because Qt swallows exceptions raised inside a
         slot: a typo in here used to leave the window stuck on "reconstructing"
-        with nothing in the console to say why. Surfacing it in the status bar
+        with nothing in the console to say why. Surfacing it in the details panel
         costs four lines and turns a silent hang into a readable message.
+
+        A result from an older run is dropped. Two runs can overlap (a source
+        change starts one directly and one through the debounce timer), and the
+        older result used to land after the newer run started: it painted an
+        out-of-date picture and marked the window "ready" while work was still
+        going on.
         """
+        if out.get("_gen") != self._gen:
+            return
         try:
             self._paint(out)
         except Exception as e:
             import traceback; traceback.print_exc()
-            self.statusBar().showMessage(f"display error: {type(e).__name__}: {e}")
-            if self.pending is not None:
-                self.pending = None
+            self._set_state(f"display error: {type(e).__name__}: {e}")
 
     def _paint(self, out: dict):
         self.elapsed_ms = out.pop("_ms", 0)
         if "exception" in out:
-            self.statusBar().showMessage(f"error: {out['exception']}")
+            self._set_state(f"error: {out['exception']}")
         else:
             # Reduced FOV and k-space cropping change the output size, so the
             # panels get a new extent rather than just new data when it changes.
@@ -341,16 +369,8 @@ class Main(QMainWindow):
             self.canvas.draw_idle()
             self._update_scorecard(out)
             self.canvas.draw_idle()
-            self.status_text = self._status(out)
-            self.statusBar().showMessage(self.status_text)
-
-        # A setting changed while this reconstruction was still running, so the
-        # picture on screen is already out of date. Run once more with the
-        # latest values. Without this the last drag of a slider is silently
-        # dropped and the display quietly disagrees with the controls.
-        if self.pending is not None:
-            self.pending = None
-            self._run()
+            self._details = self._detail_rows(out)
+            self._set_state(f"ready  ({self.elapsed_ms} ms)")
 
     # ------
     # Scorecard
@@ -358,14 +378,12 @@ class Main(QMainWindow):
 
     # name, how to print it, and whether a bigger number is the better one
     _SCORES = (
-        ("Acceleration", lambda v: f"{v:.2f}\u00d7", True),
-        ("Scan time", None, False),                      # seconds, or % of a full scan
         ("Aliasing loss", lambda v: f"{v:.1f} %", False),
         ("SNR", lambda v: f"{v:.1f}", True),
         ("SSIM", lambda v: f"{v:.3f}", True),
         ("PSNR", lambda v: f"{v:.2f} dB", True),
     )
-    _DELTA = {"Acceleration": "{:+.2f}\u00d7", "Aliasing loss": "{:+.1f} %",
+    _DELTA = {"Aliasing loss": "{:+.1f} %",
               "SNR": "{:+.1f}", "SSIM": "{:+.3f}", "PSNR": "{:+.2f} dB"}
 
     def _build_scorecard(self, ax):
@@ -384,7 +402,7 @@ class Main(QMainWindow):
         ax.plot([0.08, 0.92], [0.785, 0.785], color="#444444", lw=0.8)
         self.score_cells = {}
         for i, (name, _, _) in enumerate(self._SCORES):
-            y = 0.70 - i*0.118
+            y = 0.66 - i*0.16
             ax.text(0.10, y, name, ha="left", va="center", color="#cfcfcf", fontsize=11)
             now = ax.text(0.62, y, "", ha="right", va="center", color="white",
                           fontsize=12, family="monospace")
@@ -398,13 +416,6 @@ class Main(QMainWindow):
         Fills the rows. The deltas are against the base panel, so green and
         red say directly whether a change helped.
 
-            Acceleration  1 / the share of one full scan this run acquires:
-                          rows kept (sampling) x columns kept (partial Fourier)
-                          x scans averaged. Filters are free and never move it.
-            Scan time     one full scan's real duration, TR x ceil(lines /
-                          echo train) from the file, times the fraction of rows
-                          acquired. Without timing (the phantom) it is the
-                          percentage of one full scan.
             Aliasing loss energy of the skipped samples / total (Parseval)
             SNR           tissue / background noise, from the picture alone
             SSIM, PSNR    against the reference: the average of the other
@@ -412,26 +423,15 @@ class Main(QMainWindow):
         """
         import math
 
-        def scan_time(sampling):
-            if self.timing:
-                tr, train = self.timing
-                return tr*math.ceil(sampling["scanner_lines"]/train)*sampling["acquired"]
-            return 100*sampling["acquired"]
-
         def scores(metrics, sampling):
-            return {"Acceleration": sampling["acceleration"],
-                    "Scan time": scan_time(sampling),
-                    "Aliasing loss": 100*sampling["alias_energy"],
+            return {"Aliasing loss": 100*sampling["alias_energy"],
                     "SNR": metrics["snr"], "SSIM": metrics["ssim"], "PSNR": metrics["psnr"]}
 
         now = scores(out["metrics"], out["sampling"])
         base = scores(*self.base_scores) if self.base_scores else now
         lines = []
-        seconds = self.timing is not None
         for name, fmt, higher_better in self._SCORES:
             v, b = now[name], base[name]
-            if name == "Scan time":
-                fmt = (lambda x: f"{x:.1f} s") if seconds else (lambda x: f"{x:.0f} %")
             shown = "\u221e" if math.isinf(v) else fmt(v)   # a perfect match
             if math.isinf(v) or math.isinf(b):
                 d, colour, dtext = 0.0, "#8a8a8a", "\u2014" if math.isinf(v) != math.isinf(b) else "\u00b10"
@@ -440,34 +440,81 @@ class Main(QMainWindow):
                 tiny = abs(d) < 5e-4*max(1.0, abs(b))
                 better = (d > 0) == higher_better
                 colour = "#8a8a8a" if tiny else ("#4cd07d" if better else "#ff6b6b")
-                pattern = self._DELTA.get(name) or ("{:+.1f} s" if seconds else "{:+.0f} %")
-                dtext = "\u00b10" if tiny else pattern.format(d)
+                dtext = "\u00b10" if tiny else self._DELTA[name].format(d)
             cell_now, cell_delta = self.score_cells[name]
             cell_now.set_text(shown)
             cell_delta.set_text(dtext); cell_delta.set_color(colour)
             lines.append(f"{name}  {shown}  {dtext}")
         self.info_text = "\n".join(lines)
 
-    def _status(self, out: dict) -> str:
-        """Everything that is not a score: time, what is on, where the data came from."""
-        parts = [f"ready ({self.elapsed_ms} ms)",
-                 "{} of {} rows, {} of {} columns measured".format(
-                     *out["sampling"]["rows"], *out["sampling"]["cols"])]
-        edits = self._active_edits().strip()
-        if edits:
-            parts.append(edits)
+    # ------
+    # Scan details (right of the k-space)
+    # ------
+
+    def _build_details(self, ax):
+        """A box like the scorecard's: grey keys on the left, values beside them."""
+        from matplotlib.patches import FancyBboxPatch
+        ax.axis("off")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.set_title("scan details", color="white", fontsize=9)
+        ax.add_patch(FancyBboxPatch((0.04, 0.04), 0.92, 0.9,
+                                    boxstyle="round,pad=0.0,rounding_size=0.04",
+                                    facecolor="#262626", edgecolor="#444444", lw=1.0))
+        self.detail_ax = ax
+        self.detail_artists = []   # one key and one value text per line, redrawn each time
+        self._details = []
+        self.state = ""
+        self.details_text = ""
+
+    def _detail_rows(self, out: dict) -> list:
+        """
+        (key, value) pairs the controls do not already show: what was measured,
+        what alignment found, which scanner, and what the scores compare with.
+        """
+        rows = [("measured", "{} of {} rows\n{} of {} columns".format(
+            *out["sampling"]["rows"], *out["sampling"]["cols"]))]
         if out["averaged"] > 1:
-            # Say what alignment found, so a failure is explainable: a phase
-            # offset near pi is exactly what cancels a naive average.
+            # A phase offset near pi is exactly what cancels a naive average,
+            # so it is shown: it explains why alignment matters.
             al = out["alignment"]
-            found = "" if not al["phases"] else (
-                " (phase offsets " + ", ".join(f"{p:+.2f}" for p in al["phases"]) + " rad, shifts "
-                + ", ".join(str(d) for d in al["shifts"]) + ")")
-            parts.append(f"averaged {out['averaged']} scans{found}")
-        parts.append(self.raw_note if self.raw_note else "simulated phantom")
+            rows.append(("averaged", f"{out['averaged']} scans"))
+            if al["phases"]:
+                rows.append(("phase offsets", ", ".join(f"{p:+.2f}" for p in al["phases"]) + " rad"))
+                rows.append(("shifts", "  ".join(f"({d[0]},{d[1]})" for d in al["shifts"]) + " px"))
+        if self.raw_note:
+            parts = [p.strip() for p in self.raw_note.split("|")]
+            rows.append(("scanner", parts[0]))
+            rows.append(("", " \u00b7 ".join(parts[1:4])))
+            rows.append(("", " \u00b7 ".join(parts[4:])))
+        else:
+            rows.append(("source", "simulated phantom"))
         if self.ref_note:
-            parts.append(f"ref: {self.ref_note}")
-        return "   |   ".join(parts)
+            rows.append(("reference", self.ref_note))
+        return rows
+
+    def _set_state(self, state: str):
+        """Shows reconstructing / ready / an error as the first detail row."""
+        import textwrap
+        self.state = state
+        keys, vals = [], []
+        for key, value in [("status", state)] + self._details:
+            wrapped = []
+            for part in str(value).split("\n"):
+                wrapped += textwrap.wrap(part, 34) or [""]
+            keys += [key] + [""]*(len(wrapped)-1)
+            vals += wrapped
+        # Each line at a fixed height, so keys and values can never drift apart.
+        for artist in self.detail_artists:
+            artist.remove()
+        self.detail_artists = []
+        step = min(0.075, 0.8/max(len(vals), 1))
+        for i, (key, value) in enumerate(zip(keys, vals)):
+            y = 0.86 - i*step
+            for x, text, colour in ((0.09, key, "#8a8a8a"), (0.36, value, "#dddddd")):
+                self.detail_artists.append(self.detail_ax.text(
+                    x, y, text, ha="left", va="top", color=colour, fontsize=9))
+        self.details_text = "\n".join(f"{k} {v}" for k, v in zip(keys, vals))
+        self.canvas.draw_idle()
 
     def _active_edits(self) -> str:
         """Names whatever is switched on, so a surprising picture is explainable."""
@@ -543,18 +590,23 @@ if __name__ == "__main__":
             # done: the queued signal has landed and _show has painted metrics
             for _ in range(400):
                 app.processEvents()
-                msg = win.statusBar().currentMessage()
+                msg = win.state
                 if win.pending is None and msg and not msg.startswith("reconstructing"):
                     return
                 win.worker.wait(50)
-            raise AssertionError(win.statusBar().currentMessage())
+            raise AssertionError(win.state)
 
         wait_done()
         # Full sampling: every line measured, and all five scores on the card.
-        assert "256 of 256 rows, 256 of 256 columns measured" in win.status_text, win.status_text
-        for name in ("Acceleration", "Scan time", "Aliasing loss", "SNR", "SSIM", "PSNR"):
+        assert "256 of 256 rows" in win.details_text and "256 of 256 columns" in win.details_text, \
+            win.details_text
+        assert win.state.startswith("ready"), win.state
+        assert win.statusBar().isHidden() or not win.statusBar().currentMessage(), "no status bar"
+        for name in ("Aliasing loss", "SNR", "SSIM", "PSNR"):
             assert name in win.info_text, win.info_text
-        assert "1.00\u00d7" in win.info_text and "0.0 %" in win.info_text
+        for gone in ("Acceleration", "Scan time"):
+            assert gone not in win.info_text, win.info_text
+        assert "0.0 %" in win.info_text
 
         before = win.artists[3].get_array().copy()   # augmented reconstruction
         win.controls.rate.setValue(50)
@@ -569,21 +621,17 @@ if __name__ == "__main__":
         assert len(win.artists) == 4, f"expected 4 panels, got {len(win.artists)}"
         assert win.artists[0] is None, "panel 0 is the scorecard, not an image"
 
-        # the card moves with the knob: half the lines is twice as fast, it
-        # aliases, and both show as a change against the base
+        # the card moves with the knob: half the lines aliases, and it shows
+        # as a change against the base
         win.controls.rate.setValue(50)
         win.timer.stop(); win._run(); wait_done()
-        now, delta = win.score_cells["Acceleration"]
-        assert now.get_text() == "2.00\u00d7" and delta.get_text() == "+1.00\u00d7", win.info_text
-        now, delta = win.score_cells["Scan time"]
-        assert now.get_text() == "50 %" and delta.get_color() == "#4cd07d", win.info_text
         now, delta = win.score_cells["Aliasing loss"]
         assert float(now.get_text().split()[0]) > 20 and delta.get_color() == "#ff6b6b"
         now, delta = win.score_cells["SSIM"]
         assert delta.get_text().startswith("-") and delta.get_color() == "#ff6b6b"
         win.controls.rate.setValue(100)
         win.timer.stop(); win._run(); wait_done()
-        assert win.score_cells["Acceleration"][1].get_text() == "\u00b10"
+        assert win.score_cells["Aliasing loss"][1].get_text() == "\u00b10"
         win.controls.rate.setValue(50)
         win.timer.stop(); win._run(); wait_done()
 
@@ -608,7 +656,6 @@ if __name__ == "__main__":
         win.controls.keep.setCurrentText("phase only")
         win.timer.stop(); win._run(); wait_done()
         assert not (base == win.artists[3].get_array()).all(), "phase only changed nothing"
-        assert "phase only" in win.status_text
         win.controls.keep.setCurrentText("magnitude and phase")
         win.timer.stop(); win._run(); wait_done()
 
@@ -633,6 +680,11 @@ if __name__ == "__main__":
         assert win.artists[2].get_array().shape == (256, 256), "the base does not upscale"
         c.upscale.setCurrentText("1")
         win.timer.stop(); win._run(); wait_done()
+
+        # every section is open at once: no accordion left to click through
+        from PySide6.QtWidgets import QGroupBox
+        groups = c.findChildren(QGroupBox)
+        assert len(groups) == 6 and all(g.isVisible() for g in groups), len(groups)
 
         # rows hide themselves when the mode cannot use them
         vis = lambda n: c._forms[n].isRowVisible(c.rows[n])
@@ -713,22 +765,9 @@ if __name__ == "__main__":
             single = win.artists[3].get_array().copy()
             c.average.setCurrentIndex(c.average.count() - 1)
             win.timer.stop(); win._run(); wait_done()
-            msg = win.status_text
+            msg = win.details_text
             assert f"averaged {c.average.count()} scans" in msg and "phase offsets" in msg, msg
-            # a real scan: TR x ceil(lines / train) per scan, from the file itself
-            import math
-            n = c.average.count()
-            tr, train = win.timing
-            k1 = load_raw_kspace(win.raw_path, c.slice_idx.value())
-            lines = int((np.abs(k1).sum(axis=(0, 1)) > 0).sum())   # phase-encode columns
-            one = tr*math.ceil(lines/train)
-            assert win.score_cells["Scan time"][0].get_text() == f"{one*n:.1f} s", (one, win.info_text)
-            assert win.score_cells["Acceleration"][0].get_text() == f"{1/n:.2f}\u00d7"
-            c.pf.setValue(60)
-            win.timer.stop(); win._run(); wait_done()
-            assert float(win.score_cells["Acceleration"][0].get_text()[:-1]) > 1/n, \
-                "partial Fourier must raise the acceleration"
-            c.pf.setValue(100)
+            assert "0.3 T" in msg and "reference" in msg, msg
             # averaging is a real denoiser: the card must say SNR went up
             now, delta = win.score_cells["SNR"]
             assert delta.get_color() == "#4cd07d", (now.get_text(), delta.get_text())
