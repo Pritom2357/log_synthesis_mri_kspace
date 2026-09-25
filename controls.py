@@ -5,14 +5,14 @@ that emits a single signal: settingsChanged(dict).
 The dict it emits is exactly what pipeline.reconstruct expects, so app.py
 never translates anything.
 
-The knobs are grouped into an accordion because there are now too many to read
-as one flat list. Within a group, rows hide themselves when they cannot do
+The knobs are grouped into titled sections, all open. Within a section, rows
+hide themselves when they cannot do
 anything: a slider the current mode ignores is worse than useless, because it
 invites you to drag it and conclude the engine is broken.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (QWidget, QFormLayout, QComboBox, QSlider,
                                QLabel, QCheckBox, QPushButton, QHBoxLayout,
                                QToolButton, QVBoxLayout, QGroupBox, QDialog,
@@ -43,7 +43,15 @@ LIMITS = {
     "spike":     ("spike offset",       0,  255),   # must land inside k-space
     "erase":     ("erase centre",       0,  512),
     "pf":        ("partial Fourier",   50,  100),   # fraction must be 0.5 .. 1.0
+    "low_pass":  ("low pass radius",    0,  512),
+    "high_pass": ("high pass radius",   0,  512),
+    "patch":     ("patch size",         1,   64),
 }
+
+# The acquisition animation: how long a full scan takes to play, and how often
+# the picture is redrawn while it plays.
+PLAY_SECONDS = 8.0
+PLAY_TICK_MS = 30
 
 
 class RangeDialog(QDialog):
@@ -108,6 +116,7 @@ class Controls(QWidget):
     settingsChanged = Signal(dict)
     loadImageClicked = Signal()
     displayChanged = Signal(float, float)   # vmin, vmax for the reconstruction
+    compareToggled = Signal(bool)           # show the base beside yours, split by a divider
 
     def __init__(self):
         super().__init__()
@@ -121,6 +130,15 @@ class Controls(QWidget):
         self.phantom_btn = QPushButton("Phantom")
 
         self.rate, self.rate_lbl = self._slider(20, 100, 100)     # /100 -> x Nyquist rate
+
+        # Acquisition in progress: how much of the scan has been read, in which
+        # line order, and a Play button that sweeps it like a running scanner.
+        self.acq, self.acq_lbl = self._slider(0, 1000, 1000)     # /1000 -> fraction read
+        self.acq_order = QComboBox(); self.acq_order.addItems(["linear", "centric"])
+        self.play_btn = QPushButton("Play"); self.play_btn.setCheckable(True)
+        self.rewind_btn = QPushButton("Rewind")
+        self._play = QTimer(self); self._play.setInterval(PLAY_TICK_MS)
+        self._play.timeout.connect(self._play_tick)
 
         # Denoising. The repetition count is filled in by app.py once it knows
         # how many scans of this slice exist on disk.
@@ -140,6 +158,18 @@ class Controls(QWidget):
         self.pf_fill = QCheckBox("rebuild the rest from Hermitian symmetry")
         self.pf_fill.setChecked(True)
         self.keep = QComboBox(); self.keep.addItems(list(KEEP_LABELS))
+        self.low_pass, self.low_pass_lbl = self._slider(0, 128, 0)    # radius, 0 = off
+        self.high_pass, self.high_pass_lbl = self._slider(0, 128, 0)  # radius, 0 = off
+
+        # Spikes and patches placed by clicking on the k-space panel. The mode
+        # buttons stay down until clicked again, so several can be placed.
+        self.spike_points: list[tuple[int, int]] = []
+        self.patch_points: list[tuple[int, int, int]] = []
+        self.spike_btn = QPushButton("Add spike"); self.spike_btn.setCheckable(True)
+        self.patch_btn = QPushButton("Add patch"); self.patch_btn.setCheckable(True)
+        self.spike_undo = QPushButton("Undo"); self.spike_clear = QPushButton("Clear")
+        self.patch_undo = QPushButton("Undo"); self.patch_clear = QPushButton("Clear")
+        self.patch, self.patch_lbl = self._slider(1, 20, 4)           # half-size in samples
 
         self.upscale = QComboBox(); self.upscale.addItems(["1", "2", "4"])
         self.interp = QComboBox(); self.interp.addItems(list(INTERP_LABELS))
@@ -156,6 +186,10 @@ class Controls(QWidget):
         self.wl_width, self.wl_width_lbl = self._slider(1, 100, 100)    # /100
         self.wl_reset = QPushButton("Reset to the full range")
         self.wl_auto = QPushButton("Fit to tissue")   # app.py measures it
+        # Compare: the base on the left of a draggable divider, yours on the
+        # right, in the same panel. Display only: nothing is recomputed. It
+        # lives here for the signal, but app.py places it above the picture.
+        self.compare = QCheckBox("compare with base")
 
         # Everything the range dialog is allowed to retune, and where it started.
         # The slice slider is deliberately absent: the file decides how many
@@ -176,6 +210,8 @@ class Controls(QWidget):
 
         sections.append((self._page([
             ("rate", "sampling rate  (x Nyquist rate)", self._slider_row(self.rate, self.rate_lbl)),
+            ("acq", "scan progress", self._slider_row(self.acq, self.acq_lbl)),
+            ("acq_row", "line order", self._row(self.acq_order, self.play_btn, self.rewind_btn)),
         ]), "2 · Sampling"))
 
         sections.append((self._page([
@@ -193,6 +229,11 @@ class Controls(QWidget):
             ("dc", "DC term", self._slider_row(self.dc, self.dc_lbl)),
             ("spike", "spike offset", self._slider_row(self.spike, self.spike_lbl)),
             ("erase", "erase centre", self._slider_row(self.erase, self.erase_lbl)),
+            ("low_pass", "low pass radius", self._slider_row(self.low_pass, self.low_pass_lbl)),
+            ("high_pass", "high pass radius", self._slider_row(self.high_pass, self.high_pass_lbl)),
+            ("spike_row", "click k-space", self._row(self.spike_btn, self.spike_undo, self.spike_clear)),
+            ("patch_row", None, self._row(self.patch_btn, self.patch_undo, self.patch_clear)),
+            ("patch", "patch size", self._slider_row(self.patch, self.patch_lbl)),
             ("keep", "k-space keeps", self.keep),
         ]), "4 · k-space edits"))
 
@@ -220,18 +261,30 @@ class Controls(QWidget):
 
         # ---------------- wiring ----------------
         for combo in (self.source, self.average, self.window, self.keep,
-                      self.upscale, self.interp):
+                      self.upscale, self.interp, self.acq_order):
             combo.currentTextChanged.connect(self._emit)
         for slider in (self.rate, self.sigma, self.noise, self.nfloor, self.sharpen,
                        self.slice_idx,
-                       self.dc, self.spike, self.erase, self.pf):
+                       self.dc, self.spike, self.erase, self.pf, self.acq,
+                       self.low_pass, self.high_pass):
             slider.valueChanged.connect(self._emit)
         self.pf_fill.toggled.connect(self._emit)
+        self.play_btn.toggled.connect(self._toggle_play)
+        self.rewind_btn.clicked.connect(lambda: self.acq.setValue(0))
+        # the two click modes exclude each other
+        self.spike_btn.toggled.connect(lambda on: on and self.patch_btn.setChecked(False))
+        self.patch_btn.toggled.connect(lambda on: on and self.spike_btn.setChecked(False))
+        self.spike_undo.clicked.connect(lambda: self._edit_points(self.spike_points, undo=True))
+        self.spike_clear.clicked.connect(lambda: self._edit_points(self.spike_points))
+        self.patch_undo.clicked.connect(lambda: self._edit_points(self.patch_points, undo=True))
+        self.patch_clear.clicked.connect(lambda: self._edit_points(self.patch_points))
+        self.patch.valueChanged.connect(lambda v: self.patch_lbl.setText(str(v)))
         # Window/level does not go through _emit: it changes nothing the engine
         # computes, so triggering a reconstruction for it would be wasted work.
         for slider in (self.wl_centre, self.wl_width):
             slider.valueChanged.connect(self._emit_display)
         self.wl_reset.clicked.connect(self.reset_display)
+        self.compare.toggled.connect(self.compareToggled)
         self.load_btn.clicked.connect(self.loadImageClicked)
 
         self._update_visibility()
@@ -314,6 +367,57 @@ class Controls(QWidget):
     # State
     # ------
 
+    # ------
+    # Acquisition animation
+    # ------
+
+    def _toggle_play(self, on: bool) -> None:
+        """Play sweeps the scan progress up; from a finished scan it starts over."""
+        if on:
+            if self.acq.value() >= self.acq.maximum():
+                self.acq.setValue(0)
+            self.play_btn.setText("Pause")
+            self._play.start()
+        else:
+            self.play_btn.setText("Play")
+            self._play.stop()
+
+    def _play_tick(self) -> None:
+        step = max(1, round(self.acq.maximum()*PLAY_TICK_MS/(PLAY_SECONDS*1000)))
+        self.acq.setValue(min(self.acq.maximum(), self.acq.value() + step))
+        if self.acq.value() >= self.acq.maximum():
+            self.play_btn.setChecked(False)
+
+    # ------
+    # Points clicked on the k-space panel
+    # ------
+
+    def click_mode(self) -> str | None:
+        """'spike', 'patch' or None: what a click on the k-space panel adds."""
+        if self.spike_btn.isChecked():
+            return "spike"
+        if self.patch_btn.isChecked():
+            return "patch"
+        return None
+
+    def add_point(self, row: int, col: int) -> None:
+        """Called by app.py with the clicked k-space sample."""
+        mode = self.click_mode()
+        if mode == "spike":
+            self.spike_points.append((row, col))
+        elif mode == "patch":
+            self.patch_points.append((row, col, self.patch.value()))
+        else:
+            return
+        self._emit()
+
+    def _edit_points(self, points: list, undo: bool = False) -> None:
+        if undo and points:
+            points.pop()
+        elif not undo:
+            points.clear()
+        self._emit()
+
     def set_repetitions(self, n: int) -> None:
         """How many scans of this slice exist; offers 1..n to average."""
         self.average.blockSignals(True)
@@ -359,6 +463,12 @@ class Controls(QWidget):
             "spike": self.spike.value(),
             "erase": self.erase.value(),
             "partial_fourier": self.pf.value() / 100.0,
+            "acquired": self.acq.value() / self.acq.maximum(),
+            "acq_order": self.acq_order.currentText(),
+            "spikes": tuple(self.spike_points),
+            "patches": tuple(self.patch_points),
+            "low_pass": self.low_pass.value(),
+            "high_pass": self.high_pass.value(),
             "pf_fill": self.pf_fill.isChecked(),
             "upscale": int(self.upscale.currentText()),
             "interp": INTERP_LABELS[self.interp.currentText()],
@@ -373,8 +483,15 @@ class Controls(QWidget):
         self.slice_lbl.setText(str(self.slice_idx.value()))
         self.dc_lbl.setText(f"{self.dc.value()/100:.2f}")
         self.pf_lbl.setText(f"{self.pf.value()/100:.2f}")
+        self.acq_lbl.setText(f"{100*self.acq.value()/self.acq.maximum():.0f}%")
+        self.spike_btn.setText(f"Add spike ({len(self.spike_points)})" if self.spike_points
+                               else "Add spike")
+        self.patch_btn.setText(f"Add patch ({len(self.patch_points)})" if self.patch_points
+                               else "Add patch")
         for sl, lbl in ((self.spike, self.spike_lbl),
-                        (self.erase, self.erase_lbl)):
+                        (self.erase, self.erase_lbl),
+                        (self.low_pass, self.low_pass_lbl),
+                        (self.high_pass, self.high_pass_lbl)):
             lbl.setText("off" if sl.value() == 0 else str(sl.value()))
         self._update_visibility()
         self.settingsChanged.emit(self.settings())
