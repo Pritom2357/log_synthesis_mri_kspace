@@ -20,7 +20,8 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["dc_index","phase_axis","measured_lines",
-           "scale_dc","add_spike","erase_patch","partial_fourier",
+           "scale_dc","add_spike","erase_patch","place_spikes","erase_patches",
+           "partial_fourier",
            "hermitian_fill","keep_part"] # Only these will be exported
 
 # ------
@@ -142,6 +143,40 @@ def erase_patch(k:np.ndarray,dy:int,dx:int,size:int)->np.ndarray:
     out[...,y0:y1,x0:x1] = 0
     return out
 
+def place_spikes(k:np.ndarray,points,strength:float=1.0)->np.ndarray:
+    """
+    Plants bright points at clicked (row, col) positions, in every coil.
+
+    Each one is a single k-space entry, so each becomes one stripe pattern
+    across the whole image -- what a hardware spike (herringbone) looks like.
+    strength is relative to the brightest sample, so 1.0 matches the DC term.
+    """
+    if not points:
+        return k
+    out = np.array(k,copy=True)
+    rows,cols = k.shape[-2:]
+    peak = strength*float(np.abs(k).max())
+    for r,c in points:
+        if not (0 <= r < rows and 0 <= c < cols):
+            raise ValueError(f"spike at ({r},{c}) falls outside k-space")
+        out[...,int(r),int(c)] = peak
+    return out
+
+def erase_patches(k:np.ndarray,patches)->np.ndarray:
+    """
+    Zeroes a square at each clicked (row, col, half_size), in every coil.
+
+    The same lesson as erase_patch, placed by hand: a patch at the centre
+    takes the shapes and contrast, one at the edge takes fine detail.
+    """
+    if not patches:
+        return k
+    out = np.array(k,copy=True)
+    rows,cols = k.shape[-2:]
+    for r,c,h in patches:
+        out[...,max(int(r)-h,0):min(int(r)+h+1,rows),max(int(c)-h,0):min(int(c)+h+1,cols)] = 0
+    return out
+
 def keep_part(k:np.ndarray,part:str)->np.ndarray:
     """
     Throws away either the magnitude or the phase of every k-space sample.
@@ -160,7 +195,12 @@ def keep_part(k:np.ndarray,part:str)->np.ndarray:
     if kind == "magnitude":
         return np.abs(k).astype(np.complex128)
     if kind == "phase":
-        return np.exp(1j*np.angle(k))*float(np.abs(k).mean())
+        # Unmeasured samples stay zero. A zero has no phase, and angle(0) = 0
+        # would turn every empty line into a full-strength one: on the scans
+        # here that put a bright stripe through the image and hid the anatomy.
+        mag = np.abs(k)
+        measured = mag > 0
+        return np.where(measured,np.exp(1j*np.angle(k)),0)*float(mag[measured].mean())
     raise ValueError(f"Unknown part: {part!r}. Expected: both, magnitude, phase.")
 
 def hermitian_fill(k:np.ndarray,measured:np.ndarray)->np.ndarray:
@@ -322,6 +362,17 @@ if __name__ == "__main__":
         "fraction 1.0 keeps everything and must be lossless"
     print("[partial 1.00] keeping every line is lossless, as expected")
 
+    # --- Clicked spikes and patches, in every coil ---
+    two = np.stack([k,2*k])
+    sp = place_spikes(two,[(10,20),(200,30)])
+    assert sp[0,10,20] == sp[1,10,20] == np.abs(two).max() and sp[0,200,30] == sp[0,10,20]
+    assert place_spikes(k,[]) is k
+    pt = erase_patches(two,[(128,128,3),(0,0,5)])
+    assert not pt[:,125:132,125:132].any() and not pt[:,0:6,0:6].any()
+    assert pt[:,124,128].all() and pt[:,6,0].all(), "only the squares are erased"
+    assert erase_patches(k,[]) is k
+    print("[clicked]     spikes and patches land at the clicked sample, in every coil")
+
     # --- Line layout: which axis costs time, which lines were measured ---
     assert phase_axis(k) == -2, "no empty lines: rows are assumed"
     padded = np.array(k,copy=True); padded[:,:30] = 0; padded[:,-30:] = 0
@@ -340,9 +391,12 @@ if __name__ == "__main__":
     assert edges(phase_only) > edges(mag_only)+0.2, (edges(phase_only),edges(mag_only))
     print(f"[mag/phase]   edge match with the original: phase only {edges(phase_only):.2f}"
           f", magnitude only {edges(mag_only):.2f}")
+    padded = np.array(k,copy=True); padded[:,:30] = 0
+    assert not keep_part(padded,"phase")[:,:30].any(), "unmeasured samples must stay zero"
 
     # --- Guards ---
     for bad in (lambda: keep_part(k,"neither"),
+                lambda: place_spikes(k,[(999,0)]),
                 lambda: scale_dc(k,-1.0),
                 lambda: add_spike(k,9999,0),
                 lambda: erase_patch(k,0,0,0),

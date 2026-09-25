@@ -21,13 +21,14 @@ every file in this project was acquired with.
 from __future__ import annotations
 import numpy as np
 
-from mri.kspace_core import to_kspace, from_kspace
-from mri.cartesian_sampling import make_mask
+from mri.kspace_core import to_kspace, from_kspace, low_pass, high_pass
+from mri.cartesian_sampling import make_mask, acquisition_mask
 from mri.filters import apply_window, add_noise
 from mri.metrics import compute_metrics, error_map, snr
 from mri.motion import apply_motion
 from mri.roi import reduced_fov, crop_kspace, zero_fill_to, true_crop
-from mri.kspace_edit import (scale_dc, add_spike, erase_patch, partial_fourier, keep_part,
+from mri.kspace_edit import (dc_index, scale_dc, add_spike, erase_patch, partial_fourier, keep_part,
+                             place_spikes, erase_patches,
                              phase_axis, measured_lines)
 from mri.denoise import average_repetitions, noise_floor_filter, sharpen
 from mri.interpolation import resize
@@ -60,6 +61,14 @@ DEFAULTS = {
     "partial_fourier": 1.0,    # acquire only this fraction of the lines
     "pf_fill": True,           # rebuild the rest from Hermitian symmetry
     "keep": "both",            # both | magnitude | phase
+    "spikes": (),              # clicked (row, col) points made as bright as DC
+    "patches": (),             # clicked (row, col, half_size) squares set to zero
+    "low_pass": 0,             # keep only within this radius of DC (0 = off)
+    "high_pass": 0,            # drop everything within this radius of DC (0 = off)
+
+    # --- acquisition in progress ---
+    "acquired": 1.0,           # fraction of the scan's time that has passed
+    "acq_order": "linear",     # linear | centric: the order lines are read in
 
     # --- resolution ---
     "upscale": 1,              # enlarge the finished image by this factor
@@ -76,6 +85,7 @@ _NO_EDITS = {
     "rate": 1.0, "window": "none", "noise": 0.0, "average": 1,
     "noise_filter": 0.0, "sharpen": 0.0, "keep": "both",
     "dc_scale": 1.0, "spike": 0, "erase": 0, "partial_fourier": 1.0,
+    "spikes": (), "patches": (), "low_pass": 0, "high_pass": 0, "acquired": 1.0,
 }
 
 # ------
@@ -140,7 +150,11 @@ def _acquire(k:np.ndarray,s:dict)->tuple[np.ndarray,np.ndarray,dict]:
     else:
         k = apply_motion(k,s["motion_amp"],s["motion"],s["motion_cycles"],s["seed"])
     rate = float(s["rate"])
-    mask = make_mask("nyquist",k.shape[-2:],1,rate=rate) # broadcasts over coils
+    dc_row = dc_index(k)[0]   # the real DC row, which scanner data has off-centre
+    mask = make_mask("nyquist",k.shape[-2:],1,rate=rate,centre=dc_row) # broadcasts over coils
+    if s["acquired"] < 1.0: # the scan is still running: later lines are not in yet
+        mask = mask*acquisition_mask(k.shape[-2:],float(s["acquired"]),s["acq_order"],
+                                     centre=dc_row)
     power = np.abs(k)**2
     facts = {"rate": rate,
              "alias_energy": float((power*(1-mask)).sum()/max(power.sum(),1e-300))}
@@ -160,7 +174,7 @@ def _coverage(k:np.ndarray,mask:np.ndarray,s:dict,n_scans:int)->dict:
     """
     rows = measured_lines(k,-2)
     cols = measured_lines(k,-1)
-    rows_kept = rows & mask[:,0].astype(bool)
+    rows_kept = rows & mask.any(axis=1)
     cols_kept = cols.copy()
     if s["partial_fourier"] < 1.0:
         n = cols.size
@@ -221,9 +235,14 @@ def reconstruct(img:np.ndarray|None,settings:dict|None=None,
     if n > 1:
         k,alignment = average_repetitions([k]+list(repeats or [])[:n-1],align=bool(s["align"]))
 
+    # The display scale comes from the WHOLE scan, before sampling or the
+    # acquisition progress removes anything. Taken after, it followed whatever
+    # had been read so far: early in a linear scan only dim outer lines are in,
+    # so they were stretched to full brightness and the colours drifted as the
+    # scan played. From the whole scan, a sample keeps its colour throughout.
+    top = float(_log_kspace(k).max())
     ks,mask,sampling = _acquire(k,s)
     sampling.update(_coverage(k,mask,s,n),scanner_lines=scanner_lines)
-    top = float(_log_kspace(ks).max()) # the display scale, fixed before any edit
     multicoil = ks.ndim == 3
     ks = add_noise(ks,s["noise"],s["seed"])*mask # receiver noise, only where measured
 
@@ -237,6 +256,12 @@ def reconstruct(img:np.ndarray|None,settings:dict|None=None,
                                          fill=bool(s["pf_fill"]))[0],-1,-2)
     if s["spike"]:
         ks = add_spike(ks,0,int(s["spike"]),strength=1.0)
+    ks = place_spikes(ks,s["spikes"])
+    ks = erase_patches(ks,s["patches"])
+    if s["low_pass"]:
+        ks = low_pass(ks,float(s["low_pass"]))
+    if s["high_pass"]:
+        ks = high_pass(ks,float(s["high_pass"]))
     ks = keep_part(ks,s["keep"])
 
     # --- denoising in k-space ---
@@ -451,6 +476,31 @@ if __name__ == "__main__":
         assert reconstruct(img,{"upscale":2,"interp":it})["recon"].shape == (512,512)
     print(f"[zero-fill]  sinc x2: each coil padded to 512 in k-space, then combined;"
           f" ssim vs sinc-enlarged reference {up['metrics']['ssim']:.3f}")
+
+    # --- Acquisition in progress, clicked edits, and the band filters ---
+    fill = {}
+    for order in ("linear","centric"):
+        fill[order] = reconstruct(img,{"acquired":0.25,"acq_order":order})["metrics"]["ssim"]
+        assert reconstruct(img,{"acquired":1.0,"acq_order":order})["metrics"]["ssim"] > 0.999
+    assert fill["centric"] > fill["linear"], "centric has the centre early, so it looks right sooner"
+    clicked = reconstruct(img,{"spikes":[(100,140)],"patches":[(128,128,4)]})
+    assert clicked["kspace"][100,140] == clicked["kspace"].max() and clicked["kspace"][128,128] == 0
+    lp = reconstruct(img,{"low_pass":20})["recon"]; hp = reconstruct(img,{"high_pass":20})["recon"]
+    steep = lambda a: float(np.percentile(np.hypot(*np.gradient(a)),99))
+    assert steep(lp) < steep(_normalise(img)) and hp.mean() < _normalise(img).mean()
+    print(f"[acquire]    a quarter of the scan: linear ssim {fill['linear']:.3f}, centric {fill['centric']:.3f};"
+          " clicked spike/patch land; low pass blurs, high pass keeps edges")
+
+    # --- A k-space sample keeps its display colour however much is acquired ---
+    full_view = reconstruct(img)["kspace"]
+    for order in ("linear","centric"):
+        for frac in (0.1,0.4,0.8):
+            part = reconstruct(img,{"acquired":frac,"acq_order":order})["kspace"]
+            shown = part > 0
+            assert np.abs(part[shown]-full_view[shown]).max() < 1e-12, (order,frac)
+    half = reconstruct(img,{"rate":0.5})["kspace"]
+    assert np.abs(half[half > 0]-full_view[half > 0]).max() < 1e-12, "undersampling too"
+    print("[colour]     every acquired sample keeps its colour at any scan progress or rate")
 
     # --- Reduced FOV shrinks the output and compares against the intended crop ---
     for f in (2,4):
