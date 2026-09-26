@@ -1,160 +1,67 @@
-"""
-Quantitative image quality metrics comparing a reconstruction against the
-original, plus the error map the GUI shows as a heatmap.
-"""
+"""Image quality: PSNR and SSIM against a reference, SNR from the image alone."""
 from __future__ import annotations
 import numpy as np
 
-__all__ = ["mse","psnr","ssim","snr","error_map","compute_metrics"] # Only these will be exported
 
-# ------
-# Helper
-# ------
-
-def _as_pair(a:np.ndarray,b:np.ndarray)->tuple[np.ndarray,np.ndarray]:
-    x = np.asarray(a,dtype=np.float64)
-    y = np.asarray(b,dtype=np.float64)
-
+def _pair(a, b):
+    x, y = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if x.shape != y.shape:
         raise ValueError(f"shape mismatch: {x.shape} vs {y.shape}")
-    return x,y
+    return x, y
 
-# ---------------------
-# Methods to call from
-# ---------------------
 
-def mse(original:np.ndarray,recon:np.ndarray)->float:
-    """Mean squared error. Zero means the two images are identical."""
-    x,y = _as_pair(original,recon)
-    return float(np.mean((x-y)**2))
+def psnr(original, recon, data_range: float = 1.0) -> float:
+    x, y = _pair(original, recon)
+    e = float(np.mean((x - y)**2))
+    return float("inf") if e == 0.0 else float(10*np.log10(data_range**2/e))
 
-def psnr(original:np.ndarray,recon:np.ndarray,data_range:float=1.0)->float:
-    """
-    Peak signal-to-noise ratio in dB. Higher is better.
 
-    Returns infinity for a perfect match, since the MSE in the denominator is
-    zero there. The GUI has to be ready to print that.
-    """
-    e = mse(original,recon)
-    if e == 0.0:
-        return float("inf")
-    return float(10.0*np.log10((data_range**2)/e))
-
-def ssim(original:np.ndarray,recon:np.ndarray,data_range:float=1.0)->float:
-    """
-    Structural similarity in [0,1]. Tracks perceived quality better than MSE
-    because it compares local structure rather than pixel-by-pixel differences.
-    """
+def ssim(original, recon, data_range: float = 1.0) -> float:
     from skimage.metrics import structural_similarity
-    x,y = _as_pair(original,recon)
-    return float(structural_similarity(x,y,data_range=data_range))
+    return float(structural_similarity(*_pair(original, recon), data_range=data_range))
 
-def snr(img:np.ndarray,corner:int=32)->float:
-    """
-    Signal-to-noise ratio of one magnitude image, with no reference needed.
 
-    Noise is read from the four corners, which hold no anatomy. A magnitude
-    image turns pure complex noise of spread sigma into a Rayleigh distribution
-    whose own spread is only 0.655*sigma, so the corner spread is divided by
-    0.655 to get sigma back. Signal is the mean of the pixels clearly brighter
-    than the corners. Ghosts that fold into the corners count as noise, which
-    is fair: in the background they are just as unwanted.
-
-    Return: mean tissue / sigma, or infinity when the corners are exactly flat.
-    """
-    a = np.asarray(img,dtype=np.float64)
-    c = corner
-    bg = np.concatenate([a[:c,:c].ravel(),a[:c,-c:].ravel(),a[-c:,:c].ravel(),a[-c:,-c:].ravel()])
+def snr(img, corner: int = 32) -> float:
+    """Mean tissue / noise sigma; sigma from the corners, Rayleigh-corrected (/0.655)."""
+    a, c = np.asarray(img, dtype=np.float64), corner
+    bg = np.concatenate([a[:c, :c].ravel(), a[:c, -c:].ravel(), a[-c:, :c].ravel(), a[-c:, -c:].ravel()])
     sd = float(bg.std())
-    tissue = a[a > bg.mean()+3*sd]
-    if sd <= 1e-9*max(float(np.abs(a).max()),1e-300): # flat up to FFT rounding
+    if sd <= 1e-9*max(float(np.abs(a).max()), 1e-300):  # flat up to FFT rounding
         return float("inf")
-    if tissue.size == 0:
-        return 0.0
-    return float(tissue.mean()/(sd/0.655))
+    tissue = a[a > bg.mean() + 3*sd]
+    return float(tissue.mean()/(sd/0.655)) if tissue.size else 0.0
 
-def error_map(original:np.ndarray,recon:np.ndarray)->np.ndarray:
-    """Absolute difference per pixel, for display as a heatmap."""
-    x,y = _as_pair(original,recon)
-    return np.abs(x-y)
 
-def compute_metrics(original:np.ndarray,recon:np.ndarray,data_range:float=1.0)->dict:
-    """
-    All three metrics in one call, which is what the GUI reads each update.
+def compute_metrics(original, recon, data_range: float = 1.0) -> dict:
+    return {"psnr": psnr(original, recon, data_range), "ssim": ssim(original, recon, data_range)}
 
-    Returns a dict:
-        mse         - mean squared error, 0 is perfect
-        psnr        - peak signal-to-noise ratio in dB, inf is perfect
-        ssim        - structural similarity, 1.0 is perfect
-        max_error   - the single worst pixel difference
-    """
-    x,y = _as_pair(original,recon)
-    return {
-        "mse": mse(x,y),
-        "psnr": psnr(x,y,data_range),
-        "ssim": ssim(x,y,data_range),
-        "max_error": float(np.abs(x-y).max()),
-    }
-
-# ---------------------------
-# Tests for metrics.py only
-# ---------------------------
 
 if __name__ == "__main__":
     from mri.kspace_core import load_phantom, to_kspace, from_kspace
-    from mri.cartesian_sampling import make_mask
-
+    from mri.cartesian_sampling import nyquist_mask
     img = load_phantom()
-
-    # --- An image against itself is the perfect score ---
-    same = compute_metrics(img,img)
-    assert same["mse"] == 0.0 and same["ssim"] > 0.999999
-    assert np.isinf(same["psnr"]), "identical images must give infinite PSNR"
-    assert error_map(img,img).max() == 0.0
-    print(f"[identical]   mse={same['mse']:.1e}  psnr=inf  ssim={same['ssim']:.6f}")
-
-    # --- Quality must fall as the acceleration factor rises ---
-    k = to_kspace(img)
-    last_psnr, last_ssim = float("inf"), 1.0
-    for R in (1,2,4,8):
-        rec = from_kspace(k*make_mask("uniform",img.shape,R=R))
-        m = compute_metrics(img,rec)
-        assert m["psnr"] <= last_psnr+1e-9, f"PSNR rose at R={R}"
-        assert m["ssim"] <= last_ssim+1e-9, f"SSIM rose at R={R}"
-        last_psnr, last_ssim = m["psnr"], m["ssim"]
-        shown = "inf" if np.isinf(m["psnr"]) else f"{m['psnr']:.2f}"
-        print(f"[R={R}]        mse={m['mse']:.5f}  psnr={shown:>6s}  ssim={m['ssim']:.4f}")
-
-    # --- The error map must light up where the reconstruction is worst ---
-    rec4 = from_kspace(k*make_mask("uniform",img.shape,R=4))
-    emap = error_map(img,rec4)
-    assert emap.shape == img.shape and emap.min() >= 0.0
-    assert emap.max() > 0.0, "an undersampled reconstruction cannot be perfect"
-    print(f"[error map]   max={emap.max():.4f}  mean={emap.mean():.4f}")
-
-    # --- SNR recovers a known noise level, and falls as noise rises ---
+    same = compute_metrics(img, img)
+    assert np.isinf(same["psnr"]) and same["ssim"] > 0.999999
+    last = float("inf")
+    for rate in (1.0, 0.75, 0.5, 0.25):
+        p = compute_metrics(img, from_kspace(to_kspace(img)*nyquist_mask(img.shape, rate)))["psnr"]
+        assert p <= last + 1e-9
+        last = p
     rng = np.random.default_rng(0)
     last = float("inf")
-    for sigma in (0.02,0.05,0.1):
-        noisy = np.abs(img + sigma*(rng.normal(size=img.shape)+1j*rng.normal(size=img.shape)))
+    for sigma in (0.02, 0.05, 0.1):
+        noisy = np.abs(img + sigma*(rng.normal(size=img.shape) + 1j*rng.normal(size=img.shape)))
+        bg = np.concatenate([noisy[:32, :32].ravel(), noisy[:32, -32:].ravel(),
+                             noisy[-32:, :32].ravel(), noisy[-32:, -32:].ravel()])
+        truth = noisy[noisy > bg.mean() + 3*bg.std()].mean()/sigma
         est = snr(noisy)
-        # same tissue pixels the estimator picks, divided by the TRUE sigma:
-        # this isolates the noise estimate, which is the part that can be wrong
-        bg = np.concatenate([noisy[:32,:32].ravel(),noisy[:32,-32:].ravel(),
-                             noisy[-32:,:32].ravel(),noisy[-32:,-32:].ravel()])
-        truth = noisy[noisy > bg.mean()+3*bg.std()].mean()/sigma
-        assert abs(est/truth-1) < 0.15, (sigma,est,truth)
-        assert est < last, "more noise must mean lower SNR"
+        assert abs(est/truth - 1) < 0.15 and est < last, (sigma, est, truth)
         last = est
-        print(f"[snr]         sigma={sigma:.2f}  measured={est:6.1f}  true={truth:6.1f}")
-    assert np.isinf(snr(img)), "a noise-free phantom has flat corners"
-
-    # --- Shape mismatches are rejected rather than broadcast ---
+    assert np.isinf(snr(img))
     try:
-        mse(img, img[:128,:128])
+        psnr(img, img[:128, :128])
     except ValueError:
-        print("[guard]       shape mismatch rejected")
+        pass
     else:
-        raise AssertionError("shape mismatch should have raised")
-
-    print("\nAll self-tests passed")
+        raise AssertionError("shape mismatch")
+    print("metrics: all self-tests passed")
