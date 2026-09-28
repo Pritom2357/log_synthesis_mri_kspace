@@ -73,6 +73,7 @@ class Controls(QWidget):
     displayChanged = Signal(float, float)
     compareToggled = Signal(bool)
     prologClicked = Signal()
+    saveClicked = Signal()
 
     def __init__(self):
         super().__init__()
@@ -112,6 +113,7 @@ class Controls(QWidget):
         self.wl_width, self.wl_width_lbl = self._slider(1, 100, 100)  # recon is [0,1]: wider shows nothing more
         self.wl_reset, self.wl_auto = QPushButton("Reset to the full range"), QPushButton("Fit to tissue")
         self.compare = QCheckBox("compare with base")  # placed above the reconstruction by app.py
+        self.save_btn = QPushButton("Save image...")
 
         self.sliders = {n: getattr(self, n) for n in LIMITS}
         self.default_ranges = {n: (s.minimum(), s.maximum()) for n, s in self.sliders.items()}
@@ -135,6 +137,7 @@ class Controls(QWidget):
             ("6 · Display  (window / level)", [("wl_centre", "level (centre)", sl("wl_centre")),
                                                 ("wl_width", "window (width)", sl("wl_width")),
                                                 ("wl_buttons", None, _row(self.wl_auto, self.wl_reset))]),
+            ("7 · Save", [("save", None, self.save_btn)]),
         ]
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -163,6 +166,7 @@ class Controls(QWidget):
         self.compare.toggled.connect(self.compareToggled)
         self.load_btn.clicked.connect(self.loadImageClicked)
         self.prolog_btn.clicked.connect(self.prologClicked)
+        self.save_btn.clicked.connect(self.saveClicked)
 
         for kind in (QSlider, QComboBox):  # the wheel scrolls the panel, never edits a value
             for w in self.findChildren(kind):
