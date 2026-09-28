@@ -93,7 +93,9 @@ def reconstruct(img: np.ndarray | None, settings: dict | None = None, kspace: np
     zero_fill = up if up > 1 and s["interp"] == "sinc" else 1  # sinc = zero-fill each coil before RSS
     ks_out = zero_fill_to(ks, (ks.shape[-2]*zero_fill, ks.shape[-1]*zero_fill))
     recon = _normalise(sharpen(_normalise(_to_image(ks_out)), float(s["sharpen"]), sigma=float(zero_fill)))
-    reference = _normalise(np.asarray(img if reference is None else reference, dtype=np.float64))
+    if reference is None:  # no reference given: the phantom/picture itself, else score against itself
+        reference = img if img is not None else recon
+    reference = _normalise(np.asarray(reference, dtype=np.float64))
     if up > 1:
         if zero_fill == 1:
             recon = _normalise(resize(recon, up, s["interp"]))

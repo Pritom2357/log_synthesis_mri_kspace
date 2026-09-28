@@ -39,16 +39,12 @@ def add_spike(k: np.ndarray, dy: int, dx: int, strength: float = 1.0) -> np.ndar
 
 
 def erase_patch(k: np.ndarray, dy: int, dx: int, size: int) -> np.ndarray:
+    """Zeroes a disc of diameter `size` centred (dy,dx) from DC: an ideal high-pass when dy=dx=0."""
     if size < 1:
         raise ValueError("size must be at least 1")
-    out = np.array(k, copy=True)
-    rows, cols = k.shape[-2:]
+    from mri.kspace_core import radius_grid
     cy, cx = dc_index(k)
-    h = size//2
-    y0, y1 = np.clip([cy + dy - h, cy + dy + h + 1], 0, rows)
-    x0, x1 = np.clip([cx + dx - h, cx + dx + h + 1], 0, cols)
-    out[..., y0:y1, x0:x1] = 0
-    return out
+    return np.where(radius_grid(k.shape[-2:], (cy + dy, cx + dx)) <= size/2, 0, k)
 
 
 def keep_part(k: np.ndarray, part: str) -> np.ndarray:
@@ -115,6 +111,8 @@ if __name__ == "__main__":
     centre_gone = nrm(from_kspace(erase_patch(k, 0, 0, 40)))
     edge_gone = nrm(from_kspace(erase_patch(k, 90, 90, 40)))
     assert compute_metrics(img, edge_gone)["ssim"] > compute_metrics(img, centre_gone)["ssim"]
+    disc = erase_patch(k, 0, 0, 40)
+    assert disc[n//2, n//2] == 0 and disc[n//2 + 19, n//2] == 0 and disc[n//2 + 18, n//2 + 18] != 0, "a disc, not a square"
 
     for frac in (0.6, 0.75):
         filled, zero = partial_fourier(k, frac)[0], partial_fourier(k, frac, fill=False)[0]

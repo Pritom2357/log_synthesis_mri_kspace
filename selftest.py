@@ -112,7 +112,7 @@ def run(app, win):
     assert "image size" not in win.details_text
 
     groups = c.findChildren(QGroupBox)
-    assert len(groups) == 6 and all(g.isVisible() for g in groups)
+    assert len(groups) == 7 and all(g.isVisible() for g in groups)
     assert c.compare.parent() is not c and rv.isAncestorOf(c.compare)
     sizes = win.centralWidget().sizes()
     assert abs(sizes[0]/sum(sizes) - 0.62) < 0.05, sizes
@@ -172,6 +172,20 @@ def run(app, win):
     assert img.pixelColor(30, t.top() + 20).lightness() > img.pixelColor(30, t.bottom() - 20).lightness()
     assert abs(kv._fit().top() - rv._fit().top()) <= 1 and abs(kv._fit().height() - rv._fit().height()) <= 1
     assert not c.prolog_btn.isEnabled(), "the phantom has no coils"
+
+    import os, tempfile
+    from PySide6.QtGui import QImage
+    out_png = os.path.join(tempfile.mkdtemp(), "recon.png")
+    real_save = main.QFileDialog.getSaveFileName
+    main.QFileDialog.getSaveFileName = lambda *a, **k: (out_png, "")
+    c.save_btn.click()
+    main.QFileDialog.getSaveFileName = real_save
+    saved = QImage(out_png)
+    h, w = rv.get_array().shape
+    assert (saved.width(), saved.height()) == (w, h), "saved at the image's own resolution"
+    px = QImage(saved).convertToFormat(QImage.Format_Grayscale8)
+    got = np.array([px.pixelColor(x, h//2).red() for x in range(w)])
+    assert np.abs(got - np.round(rv.get_array()[h//2]*255)).max() <= 1, "saved pixels = displayed pixels"
 
     multi = [f for f in win.datasets if len(find_repetitions(str(f))) > 1]
     if not multi:

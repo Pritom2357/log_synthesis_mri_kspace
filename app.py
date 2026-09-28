@@ -1,5 +1,5 @@
 """
-MRI k-space simulator.
+kSight: MRI k-space simulator.
 
     python app.py               # opens the window
     python app.py --selftest    # headless wiring check
@@ -17,7 +17,7 @@ import matplotlib.dates  # noqa: F401  must precede PySide6, whose import hook b
 from matplotlib import colormaps
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRect, QPoint
-from PySide6.QtGui import QAction, QImage, QPixmap, QPainter, QColor, QPen, QFont
+from PySide6.QtGui import QAction, QIcon, QImage, QPixmap, QPainter, QColor, QPen, QFont
 from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QScrollArea, QFileDialog,
                                QMessageBox, QWidget, QLabel, QFrame, QGridLayout, QVBoxLayout,
                                QHBoxLayout, QDialog, QPushButton)
@@ -363,7 +363,7 @@ class Main(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MRI k-space simulator")
+        self.setWindowTitle("kSight — MRI k-space simulator")
         self.image = load_phantom()
         self.worker, self.pending, self._gen = None, None, 0
         self.raw_path, self.raw_note, self.ref_note = None, "", ""
@@ -417,6 +417,7 @@ class Main(QMainWindow):
         c.loadImageClicked.connect(self._load_image)
         c.phantom_btn.clicked.connect(self._load_phantom)
         c.prologClicked.connect(self._open_prolog)
+        c.saveClicked.connect(self._save_image)
         self._prolog = None
         self._update_prolog_button()
 
@@ -540,6 +541,14 @@ class Main(QMainWindow):
         self.controls.prolog_btn.setEnabled(ok)
         self.controls.prolog_btn.setToolTip("Show how the coils combine into the image" if ok
                                             else f"Needs a multi-coil scan: {why}")
+
+    def _save_image(self):
+        """Your reconstruction as displayed (window/level applied), at its full resolution."""
+        name = f"{Path(self.raw_path).stem}_slice{self.controls.slice_idx.value()}" if self.raw_path else "image"
+        path, _ = QFileDialog.getSaveFileName(self, "Save reconstruction", f"{name}_recon.png",
+                                              "PNG image (*.png);;TIFF image (*.tif *.tiff);;JPEG image (*.jpg)")
+        if path and not self.rview._pix.save(path):
+            QMessageBox.warning(self, "Could not save", f"Could not write {path}")
 
     def _edit_ranges(self):
         dlg = RangeDialog(self.controls, self)
@@ -732,7 +741,12 @@ if __name__ == "__main__":
     if selftest:
         import os
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    if sys.platform == "win32":  # own taskbar entry, so Windows shows our icon instead of Python's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("log_synthesis.kSight")
     app = QApplication(sys.argv)
+    app.setApplicationName("kSight")
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent/"assets"/"mark.png")))
     win = Main()
     win.resize(1400, 820)
     win.show()
